@@ -167,10 +167,11 @@ pub async fn create_merchant(
     }
 
     let merchant_id = Uuid::new_v4();
+
     let merchant = sqlx::query!(
         r#"
         INSERT INTO merchants 
-        (id, name, email, wallet_address, webhook_url, 
+        (id, name, email, wallet_address, webhook_url,
          bank_account_number, bank_code, account_name, business_address, settlement_currency,
          created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
@@ -195,7 +196,7 @@ pub async fn create_merchant(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let api_key = crate::auth::generate_api_key(&state, merchant_id).await
+    let api_key = crate::auth::generate_api_key_string(&state, merchant_id).await
         .map_err(|e| {
             tracing::error!("Failed to generate API key: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR

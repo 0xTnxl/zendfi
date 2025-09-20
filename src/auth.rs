@@ -73,26 +73,27 @@ pub async fn authenticate_merchant(
     Ok(next.run(request).await)
 }
 
-pub async fn generate_api_key(
-    state: &AppState,
-    merchant_id: Uuid,
+pub async fn generate_api_key_string(
+    state: &AppState, 
+    merchant_id: Uuid
 ) -> Result<String, Box<dyn std::error::Error>> {
-    // Generate a secure random API key
     let key_bytes: [u8; 32] = rand::random();
     let api_key = format!("zfi_live_{}", hex::encode(key_bytes));
     
-    // Hash the key for storage
     let key_hash = sha2::Sha256::digest(api_key.as_bytes());
     let key_hash_hex = hex::encode(key_hash);
     
+    let key_prefix = api_key.chars().take(12).collect::<String>();
+    
     sqlx::query!(
         r#"
-        INSERT INTO api_keys (id, merchant_id, key_hash, is_active, created_at)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO api_keys (id, merchant_id, key_hash, key_prefix, is_active, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6)
         "#,
         Uuid::new_v4(),
         merchant_id,
         key_hash_hex,
+        key_prefix,
         true,
         chrono::Utc::now()
     )
