@@ -16,12 +16,12 @@ pub async fn create_payment(
     Extension(merchant): Extension<AuthenticatedMerchant>,
     Json(request): Json<CreatePaymentRequest>,
 ) -> Result<Json<PaymentResponse>, StatusCode> {
-    // Validate amount
+    // Validate amount first
     if request.amount <= 0.0 {
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Convert NGN to USD if needed
+    // Convert NGN to USD if it's needed
     let (amount_usd, amount_ngn) = if request.currency == "NGN" {
         let rate = crate::exchange::get_current_rate(&state).await
             .map_err(|e| {
@@ -93,7 +93,6 @@ pub async fn confirm_payment(
     State(state): State<AppState>,
     Path(payment_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Update payment status
     sqlx::query!(
         "UPDATE payments SET status = 'confirmed' WHERE id = $1",
         payment_id
@@ -102,7 +101,6 @@ pub async fn confirm_payment(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Trigger webhook
     let _ = create_webhook_event(&state, payment_id, WebhookEventType::PaymentConfirmed).await;
 
     Ok(Json(serde_json::json!({
@@ -134,7 +132,6 @@ pub async fn get_payment_status(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Check Solana blockchain for confirmation
     let status = crate::solana::check_payment_status(&state, id).await
         .map_err(|e| {
             tracing::error!("Failed to check payment status: {}", e);
@@ -152,7 +149,6 @@ pub async fn create_merchant(
     State(state): State<AppState>,
     Json(request): Json<CreateMerchantRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Validate Solana wallet address
     if crate::solana::validate_solana_address(&request.wallet_address).is_err() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -248,6 +244,37 @@ pub async fn get_exchange_rates(
         })?;
     
     Ok(Json(rate))
+}
+
+pub async fn system_health(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let db_healthy = check_database_health(&state.db).await;
+    let solana_stats = state.solana_client.get_endpoint_stats().await;
+    let exchange_healthy = crate::exchange::get_current_rate(&state).await.is_ok();
+    
+    let solana_healthy = solana_stats.iter().any(|(_, health)| health.consecutive_failures < 3);
+    
+    Json(serde_json::json!({
+        "status": if db_healthy && solana_healthy && exchange_healthy { "healthy" } else { "degraded" },
+        "services": {
+            "database": if db_healthy { "up" } else { "down" },
+            "solana_endpoints": solana_stats.iter().map(|(url, health)| {
+                serde_json::json!({
+                    "url": url,
+                    "status": if health.consecutive_failures < 3 { "up" } else { "down" },
+                    "success_rate": health.success_rate,
+                    "avg_latency_ms": health.avg_latency_ms,
+                    "consecutive_failures": health.consecutive_failures
+                })
+            }).collect::<Vec<_>>(),
+            "exchange_api": if exchange_healthy { "up" } else { "down" }
+        },
+        "timestamp": chrono::Utc::now(),
+        "version": "0.1.0"
+    }))
+}
+
+async fn check_database_health(db: &sqlx::PgPool) -> bool {
+    sqlx::query("SELECT 1").fetch_one(db).await.is_ok()
 }
 
 pub async fn handle_webhook(

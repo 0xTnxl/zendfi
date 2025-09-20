@@ -12,6 +12,7 @@ mod auth;
 mod models;
 mod handlers;
 mod solana;
+mod sol_client;
 mod database;
 mod exchange;
 mod config;
@@ -19,12 +20,15 @@ mod webhooks;
 
 use handlers::*;
 use config::Config;
+use std::sync::Arc;
+
 
 #[derive(Clone)]
 pub struct AppState {
-    db: sqlx::PgPool,
-    solana_rpc_url: String,
-    config: Config,
+    pub db: sqlx::PgPool,
+    pub solana_rpc_url: String,
+    pub solana_client: Arc<sol_client::ResilientSolanaClient>,
+    pub config: Config,
 }
 
 #[tokio::main]
@@ -45,19 +49,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Database connection
     let db = database::initialize_database(&config.database_url).await?;
     
+    // ✅ CREATE RESILIENT SOLANA CLIENT
+    let solana_client = Arc::new(sol_client::ResilientSolanaClient::new(
+        config.solana_rpc_urls.clone()
+    ));
+    
+    // ✅ START ENDPOINT MONITORING
+    let monitor_client = solana_client.clone();
+    tokio::spawn(sol_client::start_endpoint_monitor(monitor_client));
+    
     let state = AppState {
         db,
-        solana_rpc_url: config.solana_rpc_url.clone(),
+        solana_rpc_url: config.solana_rpc_urls.first()
+            .unwrap_or(&"https://api.devnet.solana.com".to_string())
+            .clone(),
+        solana_client: solana_client.clone(),
         config: config.clone(),
     };
 
-    // Test the Solana connection via HTTP
     match test_solana_connection(&state.solana_rpc_url).await {
         Ok(_) => tracing::info!("Connected to Solana RPC"),
         Err(e) => tracing::warn!("Solana RPC connection issue: {}", e),
     }
 
-    // Start webhook retry worker
     let webhook_state = state.clone();
     tokio::spawn(webhooks::webhook_retry_worker(webhook_state));
 
@@ -67,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Public routes (no authentication required)
     let public_routes = Router::new()
         .route("/health", get(health_check))
+        .route("/system/health", get(system_health)) 
         .route("/", get(root_handler))
         .route("/api/v1/merchants", post(create_merchant))
         .route("/api/v1/rates", get(get_exchange_rates))
@@ -79,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/payments", post(create_payment))
         .route("/api/v1/payments/:id", get(get_payment))
         .route("/api/v1/payments/:id/status", get(get_payment_status))
+        .route("/api/v1/payments/:id/confirm", post(confirm_payment))
         .route("/api/v1/dashboard", get(get_merchant_dashboard))
         .route("/api/v1/webhooks", get(webhooks::list_webhook_events))
         .route("/api/v1/webhooks/:id/retry", post(webhooks::retry_webhook))
@@ -129,7 +145,6 @@ People rarely visit, but since you're here...
     "#
 }
 
-// Custom CORS middleware that's guaranteed to work with Axum
 async fn cors_layer(request: Request, next: Next) -> Result<Response, StatusCode> {
     let origin = request
         .headers()

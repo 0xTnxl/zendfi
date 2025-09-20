@@ -6,11 +6,13 @@ use axum::{
 };
 use uuid::Uuid;
 use sha2::Digest;
+
 use crate::AppState;
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedMerchant {
     pub merchant_id: Uuid,
+    #[allow(dead_code)]
     pub api_key_id: Uuid,
 }
 

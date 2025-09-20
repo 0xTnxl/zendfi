@@ -1,5 +1,3 @@
-#[allow(dead_code)]
-
 use axum::{
     extract::{State, Path},
     http::StatusCode,
@@ -83,6 +81,7 @@ pub fn generate_webhook_signature(payload: &str, secret: &str) -> String {
     format!("sha256={}", hex::encode(result.into_bytes()))
 }
 
+#[allow(dead_code)]
 // Verify incoming webhook signatures (for webhook endpoints)
 pub fn verify_webhook_signature(payload: &str, signature: &str, secret: &str) -> bool {
     let expected_signature = generate_webhook_signature(payload, secret);
@@ -193,40 +192,6 @@ async fn mark_webhook_exhausted(state: &AppState, webhook_id: Uuid) -> Result<()
     .execute(&state.db)
     .await?;
     Ok(())
-}
-
-async fn schedule_webhook_retry(
-    state: &AppState,
-    webhook_id: Uuid,
-    attempt_count: i32,
-    response_code: i32,
-    response_body: String,
-) {
-    // Exp backoff: 1s, 2s, 4s, 8s, 16s ...
-    let delay_seconds = 2_u64.pow((attempt_count - 1) as u32);
-    let next_retry = Utc::now() + chrono::Duration::seconds(delay_seconds as i64);
-
-    let _ = sqlx::query!(
-        r#"
-        UPDATE webhook_events 
-        SET status = 'failed', attempts = $1, last_attempt_at = $2, 
-            next_retry_at = $3, response_code = $4, response_body = $5
-        WHERE id = $6
-        "#,
-        attempt_count,
-        Utc::now(),
-        next_retry,
-        if response_code > 0 { Some(response_code) } else { None },
-        response_body,
-        webhook_id
-    )
-    .execute(&state.db)
-    .await;
-
-    tracing::warn!(
-        "Webhook {} failed (attempt {}), retrying in {}s", 
-        webhook_id, attempt_count, delay_seconds
-    );
 }
 
 pub async fn deliver_webhook(state: AppState, webhook_id: Uuid) {

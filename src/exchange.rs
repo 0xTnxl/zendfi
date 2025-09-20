@@ -1,5 +1,3 @@
-#[allow(dead_code)]
-
 use crate::{AppState, models::ExchangeRate};
 use serde_json::Value;
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
@@ -98,6 +96,7 @@ pub async fn get_cached_rate(state: &AppState) -> Result<f64, Box<dyn std::error
     }
 }
 
+#[allow(dead_code)]
 // Nigerian bank integration functions for future implementation
 pub async fn initiate_naira_settlement(
     _bank_account: &str,

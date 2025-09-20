@@ -15,6 +15,7 @@ pub async fn initialize_database(database_url: &str) -> Result<PgPool, sqlx::Err
     Ok(pool)
 }
 
+#[allow(dead_code)]
 pub async fn health_check(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT 1").execute(pool).await?;
     Ok(())

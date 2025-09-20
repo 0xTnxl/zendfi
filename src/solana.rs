@@ -1,5 +1,5 @@
 use uuid::Uuid;
-use serde_json::{json, Value};
+use serde_json::Value;
 use bigdecimal::ToPrimitive;
 use crate::{AppState, models::PaymentStatus};
 
@@ -9,12 +9,11 @@ pub async fn generate_payment_qr(
     payment_id: &Uuid,
     amount_usd: f64,
     recipient: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
     validate_solana_address(recipient)?;
     
     let amount_usdc = (amount_usd * 1_000_000.0) as u64;
     
-    // Create Solana Pay URL
     let solana_pay_url = format!(
         "solana:{}?amount={}&spl-token={}&reference={}&label=ZendFi%20Payment&message=Payment%20{}",
         recipient,
@@ -30,7 +29,7 @@ pub async fn generate_payment_qr(
 pub async fn check_payment_status(
     state: &AppState,
     payment_id: Uuid,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
     // Get payment from database
     let payment = sqlx::query!(
         r#"SELECT id, status as "status: PaymentStatus", expires_at, transaction_signature, amount_usd
@@ -57,14 +56,12 @@ pub async fn check_payment_status(
         return Ok("expired".to_string());
     }
     
-    // Convert BigDecimal to f64 for payment discovery
     let amount_usd_f64 = payment.amount_usd.to_f64().unwrap_or(0.0);
     
     // Check for new transactions if no signature recorded yet
     if payment.transaction_signature.is_none() {
         let found_signature = discover_payment_transaction(state, payment_id, amount_usd_f64).await?;
         if let Some(signature) = found_signature {
-            // Update payment with discovered transaction
             sqlx::query!(
                 r#"UPDATE payments SET transaction_signature = $1 WHERE id = $2"#,
                 signature,
@@ -73,12 +70,10 @@ pub async fn check_payment_status(
             .execute(&state.db)
             .await?;
             
-            // Check if this transaction is confirmed
-            return verify_transaction_confirmation(state, &signature, payment_id).await;
+            return verify_transaction_confirmation_resilient(state, &signature, payment_id).await;
         }
     } else {
-        // We have a signature, check its confirmation status
-        return verify_transaction_confirmation(
+        return verify_transaction_confirmation_resilient(
             state, 
             &payment.transaction_signature.unwrap(), 
             payment_id
@@ -88,33 +83,20 @@ pub async fn check_payment_status(
     Ok("pending".to_string())
 }
 
-async fn verify_transaction_confirmation(
+async fn verify_transaction_confirmation_resilient(
     state: &AppState,
     signature: &str,
     payment_id: Uuid,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    
-    // Check transaction status via RPC
-    let response: Value = client
-        .post(&state.solana_rpc_url)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getSignatureStatuses",
-            "params": [[signature]]
-        }))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await?
-        .json()
-        .await?;
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {  
+    let response = state.solana_client.make_rpc_call(
+        "getSignatureStatuses",
+        serde_json::json!([[signature]])
+    ).await?; 
     
     if let Some(status_info) = response["result"]["value"][0].as_object() {
-        if status_info.get("err").is_none() { // No error means success
+        if status_info.get("err").is_none() {
             if let Some(confirmation_status) = status_info["confirmationStatus"].as_str() {
                 if confirmation_status == "confirmed" || confirmation_status == "finalized" {
-                    // Transaction confirmed - update database
                     sqlx::query!(
                         r#"UPDATE payments SET status = 'confirmed' WHERE id = $1"#,
                         payment_id
@@ -122,7 +104,6 @@ async fn verify_transaction_confirmation(
                     .execute(&state.db)
                     .await?;
                     
-                    // Trigger webhook
                     let _ = crate::webhooks::create_webhook_event(
                         state, 
                         payment_id, 
@@ -133,7 +114,6 @@ async fn verify_transaction_confirmation(
                 }
             }
         } else {
-            // Transaction failed
             sqlx::query!(
                 r#"UPDATE payments SET status = 'failed' WHERE id = $1"#,
                 payment_id
@@ -152,35 +132,22 @@ async fn discover_payment_transaction(
     state: &AppState,
     payment_id: Uuid,
     expected_amount: f64,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    
-    // Get recent transactions for recipient wallet
-    let response: Value = client
-        .post(&state.solana_rpc_url)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getSignaturesForAddress",
-            "params": [
-                state.config.recipient_wallet,
-                {
-                    "limit": 50,
-                    "commitment": "confirmed"
-                }
-            ]
-        }))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await?
-        .json()
-        .await?;
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { 
+    let response = state.solana_client.make_rpc_call(
+        "getSignaturesForAddress",
+        serde_json::json!([
+            state.config.recipient_wallet,
+            {
+                "limit": 50,
+                "commitment": "confirmed"
+            }
+        ])
+    ).await?;
     
     if let Some(signatures) = response["result"].as_array() {
         for sig_info in signatures {
             if let Some(signature) = sig_info["signature"].as_str() {
-                // Get transaction details
-                if let Ok(tx_details) = get_transaction_details(&state.solana_rpc_url, signature).await {
+                if let Ok(tx_details) = get_transaction_details_resilient(state, signature).await {
                     if check_transaction_for_payment_reference(&tx_details, &payment_id.to_string(), expected_amount) {
                         return Ok(Some(signature.to_string()));
                     }
@@ -192,34 +159,21 @@ async fn discover_payment_transaction(
     Ok(None)
 }
 
-async fn get_transaction_details(
-    rpc_url: &str,
+async fn get_transaction_details_resilient(
+    state: &AppState,
     signature: &str,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    
-    let response: Value = client
-        .post(rpc_url)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTransaction",
-            "params": [
-                signature,
-                {
-                    "encoding": "jsonParsed",
-                    "commitment": "confirmed",
-                    "maxSupportedTransactionVersion": 0
-                }
-            ]
-        }))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await?
-        .json()
-        .await?;
-    
-    Ok(response)
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> { 
+    state.solana_client.make_rpc_call(
+        "getTransaction",
+        serde_json::json!([
+            signature,
+            {
+                "encoding": "jsonParsed",
+                "commitment": "confirmed",
+                "maxSupportedTransactionVersion": 0
+            }
+        ])
+    ).await
 }
 
 fn check_transaction_for_payment_reference(
@@ -258,7 +212,6 @@ fn check_transaction_for_payment_reference(
     false
 }
 
-// Background monitor for all pending payments
 pub async fn start_payment_monitor(state: AppState) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     
@@ -283,8 +236,7 @@ pub async fn start_payment_monitor(state: AppState) {
     }
 }
 
-// Helper function to validate the Solana addresses
-pub fn validate_solana_address(address: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub fn validate_solana_address(address: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {  // ✅ ADD Send + Sync
     let decoded = bs58::decode(address).into_vec()
         .map_err(|_| "Invalid base58 encoding")?;
     
@@ -301,10 +253,7 @@ mod tests {
     
     #[test]
     fn test_validate_solana_address() {
-        // Valid Solana address
         assert!(validate_solana_address("11111111111111111111111111111112").is_ok());
-        
-        // Invalid address
         assert!(validate_solana_address("invalid").is_err());
     }
     
@@ -312,7 +261,7 @@ mod tests {
     async fn test_generate_payment_qr() {
         let payment_id = Uuid::new_v4();
         let amount_usd = 10.5;
-        let recipient = "11111111111111111111111111111112"; // System program for testing
+        let recipient = "11111111111111111111111111111112";
         
         let result = generate_payment_qr(&payment_id, amount_usd, recipient).await;
         assert!(result.is_ok());
@@ -320,6 +269,6 @@ mod tests {
         let url = result.unwrap();
         assert!(url.starts_with("solana:"));
         assert!(url.contains(&payment_id.to_string()));
-        assert!(url.contains("amount=10500000")); // 10.5 USDC in micro-units
+        assert!(url.contains("amount=10500000"));
     }
 }
