@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO exchange_rates (rate, source, created_at) \n        VALUES ($1, $2, $3)\n        ON CONFLICT (source) \n        DO UPDATE SET rate = $1, created_at = $3\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Numeric",
+        "Varchar",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bc38e7091968695d646fc82b63a6ddf2ed8317d82501e9f917ebe4c1db72c239"
+}

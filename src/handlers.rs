@@ -1,0 +1,272 @@
+#[allow(dead_code)]
+
+use axum::{
+    extract::{State, Path, Extension},
+    http::StatusCode,
+    Json,
+};
+use uuid::Uuid;
+use bigdecimal::{BigDecimal, FromPrimitive};
+use crate::webhooks::{create_webhook_event, WebhookEventType};
+use crate::auth::AuthenticatedMerchant;
+use crate::{AppState, models::*};
+
+pub async fn create_payment(
+    State(state): State<AppState>,
+    Extension(merchant): Extension<AuthenticatedMerchant>,
+    Json(request): Json<CreatePaymentRequest>,
+) -> Result<Json<PaymentResponse>, StatusCode> {
+    // Validate amount
+    if request.amount <= 0.0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Convert NGN to USD if needed
+    let (amount_usd, amount_ngn) = if request.currency == "NGN" {
+        let rate = crate::exchange::get_current_rate(&state).await
+            .map_err(|e| {
+                tracing::error!("Failed to get exchange rate: {}", e);
+                StatusCode::SERVICE_UNAVAILABLE
+            })?;
+        let usd_amount = request.amount / rate.usd_to_ngn;
+        (usd_amount, Some(request.amount))
+    } else {
+        // Assume USD
+        let rate = crate::exchange::get_current_rate(&state).await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let ngn_amount = request.amount * rate.usd_to_ngn;
+        (request.amount, Some(ngn_amount))
+    };
+    
+    let payment_id = Uuid::new_v4();
+    let expires_at = chrono::Utc::now() + chrono::Duration::minutes(15);
+    let amount_usd_bd = BigDecimal::from_f64(amount_usd).unwrap();
+    let amount_ngn_bd = amount_ngn.and_then(|n| BigDecimal::from_f64(n));
+    
+    // Create a new payment
+    sqlx::query!(
+        r#"
+        INSERT INTO payments (id, merchant_id, amount_usd, amount_ngn, status, metadata, created_at, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        "#,
+        payment_id,
+        merchant.merchant_id,
+        amount_usd_bd,
+        amount_ngn_bd,
+        PaymentStatus::Pending as PaymentStatus,
+        request.metadata.unwrap_or(serde_json::json!({})),
+        chrono::Utc::now(),
+        expires_at
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to create payment: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    
+    // Generate the Solana Pay QR code
+    let qr_code = crate::solana::generate_payment_qr(
+        &payment_id,
+        amount_usd,
+        &state.config.recipient_wallet
+    ).await.map_err(|e| {
+        tracing::error!("Failed to generate QR code: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Trigger webhook for payment created
+    let _ = create_webhook_event(&state, payment_id, WebhookEventType::PaymentCreated).await;
+    
+    Ok(Json(PaymentResponse {
+        id: payment_id,
+        amount: request.amount,
+        currency: request.currency,
+        status: PaymentStatus::Pending,
+        qr_code,
+        payment_url: format!("{}/pay/{}", state.config.frontend_url, payment_id),
+        expires_at,
+    }))
+}
+
+pub async fn confirm_payment(
+    State(state): State<AppState>,
+    Path(payment_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Update payment status
+    sqlx::query!(
+        "UPDATE payments SET status = 'confirmed' WHERE id = $1",
+        payment_id
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Trigger webhook
+    let _ = create_webhook_event(&state, payment_id, WebhookEventType::PaymentConfirmed).await;
+
+    Ok(Json(serde_json::json!({
+        "message": "Payment confirmed",
+        "payment_id": payment_id
+    })))
+}
+
+pub async fn get_payment(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Payment>, StatusCode> {
+    let payment = sqlx::query_as!(
+        Payment,
+        r#"SELECT id, merchant_id, amount_usd, amount_ngn, 
+                  status as "status: PaymentStatus", transaction_signature, 
+                  customer_wallet, metadata, created_at, expires_at 
+           FROM payments WHERE id = $1"#,
+        id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| StatusCode::NOT_FOUND)?;
+    
+    Ok(Json(payment))
+}
+
+pub async fn get_payment_status(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Check Solana blockchain for confirmation
+    let status = crate::solana::check_payment_status(&state, id).await
+        .map_err(|e| {
+            tracing::error!("Failed to check payment status: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    
+    Ok(Json(serde_json::json!({
+        "payment_id": id,
+        "status": status,
+        "timestamp": chrono::Utc::now()
+    })))
+}
+
+pub async fn create_merchant(
+    State(state): State<AppState>,
+    Json(request): Json<CreateMerchantRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Validate Solana wallet address
+    if crate::solana::validate_solana_address(&request.wallet_address).is_err() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let merchant_id = Uuid::new_v4();
+    let merchant = sqlx::query_as!(
+        Merchant,
+        r#"
+        INSERT INTO merchants (id, name, email, wallet_address, webhook_url, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $6)
+        RETURNING id, name, email, wallet_address, webhook_url, webhook_secret, created_at, updated_at
+        "#,
+        merchant_id,
+        request.name,
+        request.email,
+        request.wallet_address,
+        request.webhook_url,
+        chrono::Utc::now()
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to create merchant: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Generate API key
+    let api_key = crate::auth::generate_api_key(&state, merchant_id).await
+        .map_err(|e| {
+            tracing::error!("Failed to generate API key: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    
+    Ok(Json(serde_json::json!({
+        "merchant": merchant,
+        "api_key": api_key,
+        "warning": "Store this API key securely. It will not be shown again."
+    })))
+}
+
+pub async fn get_merchant_dashboard(
+    State(state): State<AppState>,
+    Extension(merchant): Extension<AuthenticatedMerchant>,
+) -> Result<Json<MerchantDashboard>, StatusCode> {
+    let stats = sqlx::query!(
+        r#"
+        SELECT 
+            COUNT(*) as total_transactions,
+            SUM(CASE WHEN status = 'confirmed' THEN 1 ELSE 0 END) as successful_transactions,
+            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_transactions,
+            SUM(CASE WHEN status = 'confirmed' THEN amount_usd ELSE 0 END) as total_volume_usd,
+            SUM(CASE WHEN status = 'confirmed' THEN COALESCE(amount_ngn, 0) ELSE 0 END) as total_volume_ngn
+        FROM payments 
+        WHERE merchant_id = $1
+        "#,
+        merchant.merchant_id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| StatusCode::NOT_FOUND)?;
+    
+    let success_rate = if stats.total_transactions.unwrap_or(0) > 0 {
+        stats.successful_transactions.unwrap_or(0) as f64 / stats.total_transactions.unwrap_or(1) as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    let total_volume_usd = stats.total_volume_usd
+        .map(|bd| bd.to_string().parse::<f64>().unwrap_or(0.0))
+        .unwrap_or(0.0);
+    let total_volume_ngn = stats.total_volume_ngn
+        .map(|bd| bd.to_string().parse::<f64>().unwrap_or(0.0))
+        .unwrap_or(0.0);
+    
+    Ok(Json(MerchantDashboard {
+        merchant_id: merchant.merchant_id,
+        total_volume_usd,
+        total_volume_ngn,
+        total_transactions: stats.total_transactions.unwrap_or(0),
+        successful_transactions: stats.successful_transactions.unwrap_or(0),
+        pending_transactions: stats.pending_transactions.unwrap_or(0),
+        success_rate,
+    }))
+}
+
+pub async fn get_exchange_rates(
+    State(state): State<AppState>,
+) -> Result<Json<ExchangeRate>, StatusCode> {
+    let rate = crate::exchange::get_current_rate(&state).await
+        .map_err(|e| {
+            tracing::error!("Failed to get exchange rate: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    
+    Ok(Json(rate))
+}
+
+pub async fn handle_webhook(
+    State(_state): State<AppState>,
+    Path(_payment_id): Path<Uuid>,
+    Json(_payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // TODO: Implement webhook handling for payment confirmations
+    Ok(Json(serde_json::json!({
+        "status": "received",
+        "timestamp": chrono::Utc::now()
+    })))
+}
+
+pub async fn health_check() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "healthy",
+        "service": "ZendFi Payment Gateway",
+        "timestamp": chrono::Utc::now(),
+        "version": "0.1.0"
+    }))
+}

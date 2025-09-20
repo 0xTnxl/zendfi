@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, merchant_id, amount_usd, amount_ngn, \n                  status as \"status: PaymentStatus\", transaction_signature, \n                  customer_wallet, metadata, created_at, expires_at \n           FROM payments WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "merchant_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "amount_usd",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 3,
+        "name": "amount_ngn",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "status: PaymentStatus",
+        "type_info": {
+          "Custom": {
+            "name": "payment_status",
+            "kind": {
+              "Enum": [
+                "pending",
+                "confirmed",
+                "failed",
+                "expired"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "transaction_signature",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "customer_wallet",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "metadata",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "441612dae85eefab5df05214dd2a8647edc848beab55812a12583e3d672b7c38"
+}
