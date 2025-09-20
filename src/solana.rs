@@ -2,23 +2,46 @@ use uuid::Uuid;
 use serde_json::Value;
 use bigdecimal::ToPrimitive;
 use crate::{AppState, models::PaymentStatus};
+use base64::{Engine as _, engine::general_purpose};
 
-pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+pub const DEVNET_USDC_MINT: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
+pub const MAINNET_USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+pub fn get_usdc_mint_for_network(network: &str) -> &'static str {
+    match network.to_lowercase().as_str() {
+        "mainnet" | "mainnet-beta" => MAINNET_USDC_MINT,
+        "devnet" | "testnet" => DEVNET_USDC_MINT,
+        _ => {
+            tracing::warn!("Unknown network '{}', defaulting to devnet USDC", network);
+            DEVNET_USDC_MINT
+        }
+    }
+}
+
+// strictly in development mode
+// ngl, it's basically here for backward compatibility at this point
+#[allow(dead_code)]
+pub fn get_usdc_mint() -> &'static str {
+    DEVNET_USDC_MINT
+}
 
 pub async fn generate_payment_qr(
     payment_id: &Uuid,
     amount_usd: f64,
     recipient: &str,
+    network: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
     validate_solana_address(recipient)?;
     
     let amount_usdc = (amount_usd * 1_000_000.0) as u64;
-    
+
+    let usdc_mint = get_usdc_mint_for_network(network);    
+
     let solana_pay_url = format!(
         "solana:{}?amount={}&spl-token={}&reference={}&label=ZendFi%20Payment&message=Payment%20{}",
         recipient,
         amount_usdc,
-        USDC_MINT,
+        usdc_mint,
         payment_id,
         payment_id
     );
@@ -29,7 +52,9 @@ pub async fn generate_payment_qr(
 pub async fn check_payment_status(
     state: &AppState,
     payment_id: Uuid,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    tracing::debug!("Checking payment status for {}", payment_id);
+    
     // Get payment from database
     let payment = sqlx::query!(
         r#"SELECT id, status as "status: PaymentStatus", expires_at, transaction_signature, amount_usd
@@ -39,13 +64,15 @@ pub async fn check_payment_status(
     .fetch_one(&state.db)
     .await?;
     
-    // If already confirmed, return status
+    tracing::debug!("Payment {} current status: {:?}, amount: ${}", 
+                   payment_id, payment.status, payment.amount_usd);
+    
     if matches!(payment.status, PaymentStatus::Confirmed) {
         return Ok("confirmed".to_string());
     }
     
-    // Check if expired
     if payment.expires_at < chrono::Utc::now() {
+        tracing::info!("Payment {} expired at {}", payment_id, payment.expires_at);
         sqlx::query!(
             r#"UPDATE payments SET status = 'expired' WHERE id = $1"#,
             payment_id
@@ -57,11 +84,14 @@ pub async fn check_payment_status(
     }
     
     let amount_usd_f64 = payment.amount_usd.to_f64().unwrap_or(0.0);
-    
-    // Check for new transactions if no signature recorded yet
+
     if payment.transaction_signature.is_none() {
+        tracing::debug!("Searching for transaction for payment {} (amount: ${})", payment_id, amount_usd_f64);
+        
         let found_signature = discover_payment_transaction(state, payment_id, amount_usd_f64).await?;
         if let Some(signature) = found_signature {
+            tracing::info!("🎉 Found transaction signature {} for payment {}", signature, payment_id);
+            
             sqlx::query!(
                 r#"UPDATE payments SET transaction_signature = $1 WHERE id = $2"#,
                 signature,
@@ -71,8 +101,11 @@ pub async fn check_payment_status(
             .await?;
             
             return verify_transaction_confirmation_resilient(state, &signature, payment_id).await;
+        } else {
+            tracing::debug!("No matching transaction found for payment {}", payment_id);
         }
     } else {
+        tracing::debug!("Payment {} already has transaction signature, verifying confirmation", payment_id);
         return verify_transaction_confirmation_resilient(
             state, 
             &payment.transaction_signature.unwrap(), 
@@ -142,7 +175,7 @@ async fn discover_payment_transaction(
     state: &AppState,
     payment_id: Uuid,
     expected_amount: f64,
-) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> { 
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     let response = state.solana_client.make_rpc_call(
         "getSignaturesForAddress",
         serde_json::json!([
@@ -154,12 +187,35 @@ async fn discover_payment_transaction(
         ])
     ).await?;
     
-    if let Some(signatures) = response["result"].as_array() {
-        for sig_info in signatures {
-            if let Some(signature) = sig_info["signature"].as_str() {
-                if let Ok(tx_details) = get_transaction_details_resilient(state, signature).await {
-                    if check_transaction_for_payment_reference(&tx_details, &payment_id.to_string(), expected_amount) {
-                        return Ok(Some(signature.to_string()));
+    if let Some(result) = response.get("result") {
+        if let Some(signatures) = result.as_array() {
+            tracing::info!("Found {} signatures for wallet {}", signatures.len(), state.config.recipient_wallet);
+            
+            for sig_info in signatures.iter() {
+                if let Some(signature) = sig_info["signature"].as_str() {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        get_transaction_details_resilient(state, signature)
+                    ).await {
+                        Ok(Ok(tx_details)) => {
+                            if check_transaction_for_payment_reference(
+                                &tx_details, 
+                                &payment_id.to_string(), 
+                                expected_amount,
+                                &state.config.solana_network 
+                            ) {
+                                tracing::info!("Found matching transaction {} for payment {}", signature, payment_id);
+                                return Ok(Some(signature.to_string()));
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!("Failed to get transaction details for {}: {}", signature, e);
+                            continue;
+                        }
+                        Err(_) => {
+                            tracing::debug!("Timeout getting transaction details for {}", signature);
+                            continue;
+                        }
                     }
                 }
             }
@@ -186,31 +242,82 @@ async fn get_transaction_details_resilient(
     ).await
 }
 
+
 fn check_transaction_for_payment_reference(
     transaction: &Value,
     payment_reference: &str,
     expected_amount: f64,
+    network: &str,
 ) -> bool {
-    if let Some(result) = transaction["result"].as_object() {
+    if let Some(result) = transaction.get("result") {
+        if result.is_null() {
+            return false;
+        }
+
+        // Check memo/logs for payment reference
         if let Some(meta) = result["meta"].as_object() {
             if let Some(log_messages) = meta["logMessages"].as_array() {
                 for log in log_messages {
                     if let Some(log_str) = log.as_str() {
                         if log_str.contains(payment_reference) {
+                            tracing::info!("Found payment reference {} in transaction logs", payment_reference);
                             return true;
                         }
                     }
                 }
             }
-            
-            if let Some(pre_balances) = meta["preBalances"].as_array() {
-                if let Some(post_balances) = meta["postBalances"].as_array() {
-                    for (i, pre_balance) in pre_balances.iter().enumerate() {
-                        if let (Some(pre), Some(post)) = (pre_balance.as_u64(), post_balances.get(i).and_then(|p| p.as_u64())) {
-                            let transferred = if post > pre { post - pre } else { pre - post };
-                            let expected_lamports = (expected_amount * 1_000_000.0) as u64;
-                            if transferred >= (expected_lamports * 99 / 100) && transferred <= (expected_lamports * 101 / 100) {
-                                return true;
+        }
+
+        // Check instruction data for payment reference
+        if let Some(transaction_obj) = result["transaction"].as_object() {
+            if let Some(message) = transaction_obj["message"].as_object() {
+                if let Some(instructions) = message["instructions"].as_array() {
+                    for instruction in instructions {
+                        if let Some(data) = instruction["data"].as_str() {
+                            if let Ok(decoded) = general_purpose::STANDARD.decode(data) {
+                                if let Ok(decoded_str) = String::from_utf8(decoded) {
+                                    if decoded_str.contains(payment_reference) {
+                                        tracing::info!("Found payment reference {} in instruction data", payment_reference);
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check token balance changes for USDC transfers
+        if let Some(meta) = result["meta"].as_object() {
+            if let Some(pre_token_balances) = meta["preTokenBalances"].as_array() {
+                if let Some(post_token_balances) = meta["postTokenBalances"].as_array() {
+                    // ✅ FIX: Use network-aware USDC mint
+                    let usdc_mint = get_usdc_mint_for_network(network);
+                    
+                    for (pre_idx, pre_balance) in pre_token_balances.iter().enumerate() {
+                        if let Some(post_balance) = post_token_balances.get(pre_idx) {
+                            // Check if this is USDC transfer
+                            if let (Some(pre_mint), Some(post_mint)) = (
+                                pre_balance["mint"].as_str(),
+                                post_balance["mint"].as_str()
+                            ) {
+                                if pre_mint == usdc_mint && post_mint == usdc_mint {
+                                    if let (Some(pre_amount), Some(post_amount)) = (
+                                        pre_balance["uiTokenAmount"]["uiAmount"].as_f64(),
+                                        post_balance["uiTokenAmount"]["uiAmount"].as_f64()
+                                    ) {
+                                        let transferred = (post_amount - pre_amount).abs();
+                                        let expected_usdc = expected_amount;
+
+                                        let tolerance = expected_usdc * 0.05;
+                                        if (transferred - expected_usdc).abs() <= tolerance {
+                                            tracing::info!("Found USDC transfer of {} (expected {}, tolerance {}) on {}", 
+                                                          transferred, expected_usdc, tolerance, network);
+                                            return true;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -246,12 +353,16 @@ pub async fn start_payment_monitor(state: AppState) {
     }
 }
 
-pub fn validate_solana_address(address: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {  // ✅ ADD Send + Sync
+pub fn validate_solana_address(address: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let decoded = bs58::decode(address).into_vec()
         .map_err(|_| "Invalid base58 encoding")?;
     
     if decoded.len() != 32 {
         return Err("Invalid Solana address length".into());
+    }
+
+    if address == "11111111111111111111111111111112" {
+        return Err("Cannot use system program as recipient wallet".into());
     }
     
     Ok(())
@@ -273,7 +384,7 @@ mod tests {
         let amount_usd = 10.5;
         let recipient = "11111111111111111111111111111112";
         
-        let result = generate_payment_qr(&payment_id, amount_usd, recipient).await;
+        let result = generate_payment_qr(&payment_id, amount_usd, recipient, "devnet").await;
         assert!(result.is_ok());
         
         let url = result.unwrap();

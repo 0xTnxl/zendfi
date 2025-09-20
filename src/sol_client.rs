@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 #[derive(Debug, Clone)]
 pub struct SolanaEndpoint {
@@ -37,6 +37,8 @@ pub struct ResilientSolanaClient {
     endpoints: Vec<SolanaEndpoint>,
     client: reqwest::Client,
     circuit_breaker_threshold: u32,
+    rate_limiter: Arc<Semaphore>,
+    last_request_time: Arc<RwLock<Instant>>,
 }
 
 impl ResilientSolanaClient {
@@ -55,10 +57,12 @@ impl ResilientSolanaClient {
         Self {
             endpoints,
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(15)) // ✅ INCREASED: Longer timeout
                 .build()
                 .expect("Failed to create HTTP client"),
             circuit_breaker_threshold: 5,
+            rate_limiter: Arc::new(Semaphore::new(10)),
+            last_request_time: Arc::new(RwLock::new(Instant::now())),
         }
     }
 
@@ -98,6 +102,21 @@ impl ResilientSolanaClient {
         method: &str,
         params: Value,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let _permit = self.rate_limiter.acquire().await?;
+
+        let mut last_request = self.last_request_time.write().await;
+        let elapsed = last_request.elapsed();
+        if elapsed < Duration::from_millis(100) {
+            let sleep_duration = Duration::from_millis(100) - elapsed;
+            drop(last_request); // Release the lock before sleeping
+            tokio::time::sleep(sleep_duration).await;
+            let mut last_request = self.last_request_time.write().await;
+            *last_request = Instant::now();
+        } else {
+            *last_request = Instant::now();
+            drop(last_request);
+        }
+
         let endpoint = self
             .select_best_endpoint()
             .await
@@ -114,7 +133,9 @@ impl ResilientSolanaClient {
             Err(e) => {
                 tracing::warn!("RPC call failed on {}: {}", endpoint.url, e);
                 
-                // Try the fallback endpoint
+                // Try fallback with exponential backoff
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                
                 if let Some(fallback) = self.select_fallback_endpoint(endpoint).await {
                     tracing::info!("Trying fallback endpoint: {}", fallback.url);
                     self.execute_rpc_call(fallback, method, params).await
@@ -131,7 +152,7 @@ impl ResilientSolanaClient {
         method: &str,
         params: Value,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let payload = json!({
+        let payload = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": method,
@@ -141,7 +162,9 @@ impl ResilientSolanaClient {
         let response = self
             .client
             .post(&endpoint.url)
-            .json(&payload)
+            .header("Content-Type", "application/json")
+            .json(&payload)  
+            .timeout(Duration::from_secs(15))
             .send()
             .await?;
 
@@ -150,7 +173,7 @@ impl ResilientSolanaClient {
         }
 
         let json_response: Value = response.json().await?;
-        
+
         if let Some(error) = json_response.get("error") {
             return Err(format!("RPC error: {}", error).into());
         }

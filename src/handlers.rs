@@ -42,6 +42,16 @@ pub async fn create_payment(
     let expires_at = chrono::Utc::now() + chrono::Duration::minutes(15);
     let amount_usd_bd = BigDecimal::from_f64(amount_usd).unwrap();
     let amount_ngn_bd = amount_ngn.and_then(|n| BigDecimal::from_f64(n));
+
+    let qr_code = crate::solana::generate_payment_qr(
+        &payment_id,
+        amount_usd,
+        &state.config.recipient_wallet,
+        &state.config.solana_network 
+    ).await.map_err(|e| {
+        tracing::error!("Failed to generate QR code: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     
     // Create a new payment
     sqlx::query!(
@@ -62,16 +72,6 @@ pub async fn create_payment(
     .await
     .map_err(|e| {
         tracing::error!("Failed to create payment: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    
-    // Generate the Solana Pay QR code
-    let qr_code = crate::solana::generate_payment_qr(
-        &payment_id,
-        amount_usd,
-        &state.config.recipient_wallet
-    ).await.map_err(|e| {
-        tracing::error!("Failed to generate QR code: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -158,6 +158,17 @@ pub async fn create_merchant(
     State(state): State<AppState>,
     Json(request): Json<CreateMerchantRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // In early tests, I discovered some merchants always make this mistake, so we have to always validate
+    if let Some(ref webhook_url) = request.webhook_url {
+        if webhook_url.contains("your-unique-id") || webhook_url == "https://webhook.site/your-unique-id" {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        
+        if !is_valid_webhook_url(webhook_url).await {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
     if crate::solana::validate_solana_address(&request.wallet_address).is_err() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -223,6 +234,20 @@ fn is_valid_nigerian_bank_code(bank_code: &str) -> bool {
         "090175", "090110", "090134", "090149", "090097"
     ];
     valid_codes.contains(&bank_code)
+}
+
+// Better validation tests for checking webhook URL
+async fn is_valid_webhook_url(url: &str) -> bool {
+    if !url.starts_with("https://") {
+        return false;
+    }
+    
+    // Quick connectivity test
+    let client = reqwest::Client::new();
+    match client.head(url).timeout(std::time::Duration::from_secs(5)).send().await {
+        Ok(response) => response.status().is_success() || response.status().is_client_error(), // 4xx is ok for webhook endpoints
+        Err(_) => false,
+    }
 }
 
 pub async fn get_settlement_status(
@@ -326,6 +351,8 @@ pub async fn system_health(State(state): State<AppState>) -> Json<serde_json::Va
     
     let solana_healthy = solana_stats.iter().any(|(_, health)| health.consecutive_failures < 3);
     
+    let system_metrics = get_system_metrics(&state.db).await;
+    
     Json(serde_json::json!({
         "status": if db_healthy && solana_healthy && exchange_healthy { "healthy" } else { "degraded" },
         "services": {
@@ -341,13 +368,83 @@ pub async fn system_health(State(state): State<AppState>) -> Json<serde_json::Va
             }).collect::<Vec<_>>(),
             "exchange_api": if exchange_healthy { "up" } else { "down" }
         },
+        "metrics": system_metrics,
         "timestamp": chrono::Utc::now(),
         "version": "0.1.0"
     }))
 }
 
+async fn get_system_metrics(db: &sqlx::PgPool) -> serde_json::Value {
+    let (pending, confirmed, failed, payments_24h, payments_1h) = 
+        sqlx::query!(
+            r#"
+            SELECT 
+                COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_payments,
+                COUNT(CASE WHEN status = 'confirmed' THEN 1 END) as confirmed_payments,
+                COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_payments,
+                COUNT(CASE WHEN created_at > NOW() - INTERVAL '24 hours' THEN 1 END) as payments_24h,
+                COUNT(CASE WHEN created_at > NOW() - INTERVAL '1 hour' THEN 1 END) as payments_1h
+            FROM payments
+            "#
+        )
+        .fetch_optional(db)  
+        .await
+        .unwrap_or(None)
+        .map(|row| (
+            row.pending_payments.unwrap_or(0),
+            row.confirmed_payments.unwrap_or(0),
+            row.failed_payments.unwrap_or(0),
+            row.payments_24h.unwrap_or(0),
+            row.payments_1h.unwrap_or(0),
+        ))
+        .unwrap_or((0, 0, 0, 0, 0)); // Default to zeros if no data
+
+    serde_json::json!({
+        "payments": {
+            "pending": pending,
+            "confirmed": confirmed,
+            "failed": failed,
+            "last_24h": payments_24h,
+            "last_1h": payments_1h
+        }
+    })
+}
+
 async fn check_database_health(db: &sqlx::PgPool) -> bool {
     sqlx::query("SELECT 1").fetch_one(db).await.is_ok()
+}
+
+// Only available in development builds
+#[cfg(debug_assertions)] 
+pub async fn reset_database(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let tables = [
+        "webhook_events",
+        "settlements", 
+        "api_keys",
+        "payments",
+        "merchants",
+        "exchange_rates"
+    ];
+    
+    for table in tables.iter() {
+        sqlx::query(&format!("TRUNCATE TABLE {} CASCADE", table))
+            .execute(&state.db)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to truncate table {}: {}", table, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+    
+    tracing::info!("Database reset completed - all tables cleared");
+    
+    Ok(Json(serde_json::json!({
+        "message": "Database reset successfully",
+        "tables_cleared": tables,
+        "timestamp": chrono::Utc::now()
+    })))
 }
 
 pub async fn handle_webhook(
