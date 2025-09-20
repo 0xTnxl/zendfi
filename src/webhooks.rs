@@ -274,7 +274,7 @@ pub async fn deliver_webhook(state: AppState, webhook_id: Uuid) {
                 
                 tracing::info!("Webhook {} delivered successfully", webhook_id);
             } else {
-                // ✅ Direct call instead of await to avoid Send issues
+                // Direct call instead of await to avoid Send issues
                 let _ = update_webhook_failed(&state, webhook_id, attempt_count, status_code, response_body).await;
             }
         }

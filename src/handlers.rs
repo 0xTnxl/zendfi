@@ -106,7 +106,7 @@ pub async fn confirm_payment(
         if let Err(e) = crate::settlements::process_settlement(&state_clone, payment_id).await {
             tracing::error!("Manual settlement processing failed for payment {}: {}", payment_id, e);
         } else {
-            tracing::info!("✅ Manual settlement processed successfully for payment {}", payment_id);
+            tracing::info!("Manual settlement processed successfully for payment {}", payment_id);
         }
     });
 

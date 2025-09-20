@@ -50,12 +50,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Database connection
     let db = database::initialize_database(&config.database_url).await?;
     
-    // ✅ CREATE RESILIENT SOLANA CLIENT
     let solana_client = Arc::new(sol_client::ResilientSolanaClient::new(
         config.solana_rpc_urls.clone()
     ));
     
-    // ✅ START ENDPOINT MONITORING
     let monitor_client = solana_client.clone();
     tokio::spawn(sol_client::start_endpoint_monitor(monitor_client));
     

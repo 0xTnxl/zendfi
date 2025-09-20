@@ -155,7 +155,7 @@ async fn simulate_bank_transfer(
     .execute(&state.db)
     .await?;
     
-    tracing::info!("✅ Settlement {} completed with reference {}", settlement_id, external_ref);
+    tracing::info!("Settlement {} completed with reference {}", settlement_id, external_ref);
     Ok(())
 }
 
