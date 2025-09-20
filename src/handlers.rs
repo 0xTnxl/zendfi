@@ -101,10 +101,19 @@ pub async fn confirm_payment(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::settlements::process_settlement(&state_clone, payment_id).await {
+            tracing::error!("Manual settlement processing failed for payment {}: {}", payment_id, e);
+        } else {
+            tracing::info!("✅ Manual settlement processed successfully for payment {}", payment_id);
+        }
+    });
+
     let _ = create_webhook_event(&state, payment_id, WebhookEventType::PaymentConfirmed).await;
 
     Ok(Json(serde_json::json!({
-        "message": "Payment confirmed",
+        "message": "Payment confirmed and settlement initiated",
         "payment_id": payment_id
     })))
 }
@@ -153,19 +162,30 @@ pub async fn create_merchant(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    if !is_valid_nigerian_bank_code(&request.bank_code) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let merchant_id = Uuid::new_v4();
-    let merchant = sqlx::query_as!(
-        Merchant,
+    let merchant = sqlx::query!(
         r#"
-        INSERT INTO merchants (id, name, email, wallet_address, webhook_url, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $6)
-        RETURNING id, name, email, wallet_address, webhook_url, webhook_secret, created_at, updated_at
+        INSERT INTO merchants 
+        (id, name, email, wallet_address, webhook_url, 
+         bank_account_number, bank_code, account_name, business_address, settlement_currency,
+         created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
+        RETURNING id, name, email, wallet_address, webhook_url
         "#,
         merchant_id,
         request.name,
         request.email,
         request.wallet_address,
         request.webhook_url,
+        request.bank_account_number,
+        request.bank_code,
+        request.account_name,
+        request.business_address,
+        request.settlement_currency,
         chrono::Utc::now()
     )
     .fetch_one(&state.db)
@@ -175,7 +195,6 @@ pub async fn create_merchant(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Generate API key
     let api_key = crate::auth::generate_api_key(&state, merchant_id).await
         .map_err(|e| {
             tracing::error!("Failed to generate API key: {}", e);
@@ -183,10 +202,63 @@ pub async fn create_merchant(
         })?;
     
     Ok(Json(serde_json::json!({
-        "merchant": merchant,
+        "merchant": {
+            "id": merchant.id,
+            "name": merchant.name,
+            "email": merchant.email,
+            "wallet_address": merchant.wallet_address,
+            "webhook_url": merchant.webhook_url
+        },
         "api_key": api_key,
+        "message": "Merchant created successfully. Settlements will be processed to your provided bank account.",
         "warning": "Store this API key securely. It will not be shown again."
     })))
+}
+
+fn is_valid_nigerian_bank_code(bank_code: &str) -> bool {
+    let valid_codes = [
+        "044", "023", "063", "050", "070", "011", "058", "076", "082", "084",
+        "221", "068", "057", "032", "033", "215", "035", "039", "040", "214",
+        "090175", "090110", "090134", "090149", "090097"
+    ];
+    valid_codes.contains(&bank_code)
+}
+
+pub async fn get_settlement_status(
+    State(state): State<AppState>,
+    Path(payment_id): Path<Uuid>,
+    Extension(merchant): Extension<AuthenticatedMerchant>,
+) -> Result<Json<crate::settlements::Settlement>, StatusCode> {
+    let settlement = crate::settlements::get_settlement_status(&state, payment_id).await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    
+    // Verify merchant owns this settlement
+    if settlement.merchant_id != merchant.merchant_id {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    
+    Ok(Json(settlement))
+}
+
+pub async fn list_settlements(
+    State(state): State<AppState>,
+    Extension(merchant): Extension<AuthenticatedMerchant>,
+) -> Result<Json<Vec<crate::settlements::Settlement>>, StatusCode> {
+    let settlements = sqlx::query_as!(
+        crate::settlements::Settlement,
+        r#"SELECT id, payment_id, merchant_id, amount_ngn, bank_account, bank_code, 
+                  account_name, status, external_reference, provider, created_at, completed_at
+           FROM settlements 
+           WHERE merchant_id = $1 
+           ORDER BY created_at DESC 
+           LIMIT 50"#,
+        merchant.merchant_id
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    Ok(Json(settlements))
 }
 
 pub async fn get_merchant_dashboard(

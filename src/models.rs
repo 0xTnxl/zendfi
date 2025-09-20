@@ -52,8 +52,13 @@ pub struct CreatePaymentRequest {
 pub struct CreateMerchantRequest {
     pub name: String,
     pub email: String,
-    pub wallet_address: String,
+    pub wallet_address: String, // We'll keep this here in case merchants want to recieve USDC directly
     pub webhook_url: Option<String>,
+    pub bank_account_number: String,
+    pub bank_code: String, // GTBank = "058", Zenith = "057", etc.
+    pub account_name: String,
+    pub business_address: String,
+    pub settlement_currency: String, // "NGN" or "USD"
 }
 
 #[derive(Debug, Serialize, Deserialize)]

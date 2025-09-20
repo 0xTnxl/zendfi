@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO settlements \n        (id, payment_id, merchant_id, amount_ngn, bank_account, bank_code, account_name, \n         status, provider, created_at)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', 'paystack', $8)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Numeric",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7d5b616830fe32da6d7636693a402a80e9573256aefc82dd2dcf7c44c47dfb52"
+}

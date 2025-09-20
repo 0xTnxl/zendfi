@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT bank_account_number, bank_code, account_name, settlement_currency, name\n           FROM merchants WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bank_account_number",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "bank_code",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "account_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "settlement_currency",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "name",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "cd147520fe7cde00cb2563adf6ca185fb0842e6d6a71f4c84a1c6073f9116daa"
+}

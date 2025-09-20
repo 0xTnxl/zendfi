@@ -13,6 +13,7 @@ mod models;
 mod handlers;
 mod solana;
 mod sol_client;
+mod settlements;
 mod database;
 mod exchange;
 mod config;
@@ -95,6 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/payments/:id", get(get_payment))
         .route("/api/v1/payments/:id/status", get(get_payment_status))
         .route("/api/v1/payments/:id/confirm", post(confirm_payment))
+        .route("/api/v1/payments/:id/settlement", get(get_settlement_status))
+        .route("/api/v1/settlements", get(list_settlements))
         .route("/api/v1/dashboard", get(get_merchant_dashboard))
         .route("/api/v1/webhooks", get(webhooks::list_webhook_events))
         .route("/api/v1/webhooks/:id/retry", post(webhooks::retry_webhook))

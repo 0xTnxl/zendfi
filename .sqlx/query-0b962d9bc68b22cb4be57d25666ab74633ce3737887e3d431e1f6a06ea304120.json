@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT rate FROM exchange_rates\n        WHERE source = 'live' AND created_at > NOW() - INTERVAL '1 hour'\n        ORDER BY created_at DESC\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "rate",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0b962d9bc68b22cb4be57d25666ab74633ce3737887e3d431e1f6a06ea304120"
+}

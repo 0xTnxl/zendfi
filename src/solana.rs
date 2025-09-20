@@ -104,6 +104,16 @@ async fn verify_transaction_confirmation_resilient(
                     .execute(&state.db)
                     .await?;
                     
+
+                    let state_clone = state.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = crate::settlements::process_settlement(&state_clone, payment_id).await {
+                            tracing::error!("Settlement processing failed for payment {}: {}", payment_id, e);
+                        } else {
+                            tracing::info!("Settlement processed successfully for payment {}", payment_id);
+                        }
+                    });
+                    
                     let _ = crate::webhooks::create_webhook_event(
                         state, 
                         payment_id, 
