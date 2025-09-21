@@ -85,8 +85,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/", get(root_handler))
         .route("/api/v1/merchants", post(create_merchant))
         .route("/api/v1/rates", get(get_exchange_rates))
-        // Webhook endpoints (external) - also public
-        .route("/api/v1/webhooks/:payment_id", post(handle_webhook))
         .with_state(state.clone());
     
     // Protected routes (require API key authentication)

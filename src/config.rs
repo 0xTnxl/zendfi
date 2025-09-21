@@ -8,6 +8,7 @@ pub struct Config {
     pub port: u16,
     pub usdc_mint: String,  
     pub solana_network: String,
+    pub merchant_wallet_dir: String,
 }
 
 impl Config {
@@ -52,6 +53,8 @@ impl Config {
                 .expect("PORT must be a valid number"),
             usdc_mint,    
             solana_network, 
+            merchant_wallet_dir: std::env::var("MERCHANT_WALLET_DIR")
+                .unwrap_or_else(|_| "./secure/merchant_wallets".to_string()),
         }
     }
 }

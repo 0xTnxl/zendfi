@@ -24,6 +24,7 @@ Thumbs.db
 # Rust/Cargo
 /target/
 Cargo.lock  # Only for applications, not libraries
+/secure/
 
 # Temporary files
 *.tmp

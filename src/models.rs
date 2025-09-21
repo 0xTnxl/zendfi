@@ -46,19 +46,40 @@ pub struct CreatePaymentRequest {
     pub description: Option<String>,
     pub metadata: Option<serde_json::Value>,
     pub webhook_url: Option<String>,
+    pub settlement_currency: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateMerchantRequest {
     pub name: String,
     pub email: String,
-    pub wallet_address: String, // We'll keep this here in case merchants want to recieve USDC directly
-    pub webhook_url: Option<String>,
-    pub bank_account_number: String,
-    pub bank_code: String, // GTBank = "058", Zenith = "057", etc.
-    pub account_name: String,
+    pub settlement_preference: Option<String>, // "auto_ngn", "auto_usdc", "per_payment"
+    pub wallet_address: Option<String>, // Optional: merchant's existing wallet
+    pub bank_account_number: Option<String>,
+    pub bank_code: Option<String>, 
+    pub account_name: Option<String>,
     pub business_address: String,
-    pub settlement_currency: String, // "NGN" or "USD"
+    pub settlement_currency: Option<String>, // Backward compatibility
+    
+    pub webhook_url: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementPreference {
+    AutoNgn,      // Always settle to NGN bank account
+    AutoUsdc,     // Always settle to USDC wallet  
+    PerPayment,   // Merchant chooses per payment
+}
+
+impl From<&str> for SettlementPreference {
+    fn from(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "auto_usdc" => SettlementPreference::AutoUsdc,
+            "per_payment" => SettlementPreference::PerPayment,
+            _ => SettlementPreference::AutoNgn, // Default
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

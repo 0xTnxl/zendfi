@@ -96,17 +96,6 @@ pub async fn get_cached_rate(state: &AppState) -> Result<f64, Box<dyn std::error
     }
 }
 
-#[allow(dead_code)]
-// Nigerian bank integration functions for future implementation
-pub async fn initiate_naira_settlement(
-    _bank_account: &str,
-    _bank_code: &str,
-    _amount_ngn: f64,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // TODO: I'll integrate with Paystack for NGN settlements
-    Ok("settlement_id_placeholder".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
