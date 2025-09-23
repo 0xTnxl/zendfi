@@ -304,14 +304,12 @@ fn check_transaction_for_payment_reference(
                     if let Some(log_str) = log.as_str() {
                         if log_str.contains(payment_reference) {
                             tracing::info!("Found payment reference {} in transaction logs", payment_reference);
-                            return true;
+                            return true; 
                         }
                     }
                 }
             }
         }
-
-        
 
         // Check instruction data for payment reference
         if let Some(transaction_obj) = result["transaction"].as_object() {
@@ -319,11 +317,11 @@ fn check_transaction_for_payment_reference(
                 if let Some(instructions) = message["instructions"].as_array() {
                     for instruction in instructions {
                         if let Some(data) = instruction["data"].as_str() {
-                            if let Ok(decoded) = general_purpose::STANDARD.decode(data) {
+                            if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(data) {
                                 if let Ok(decoded_str) = String::from_utf8(decoded) {
                                     if decoded_str.contains(payment_reference) {
                                         tracing::info!("Found payment reference {} in instruction data", payment_reference);
-                                        return true;
+                                        return true; 
                                     }
                                 }
                             }
@@ -333,54 +331,18 @@ fn check_transaction_for_payment_reference(
             }
         }
 
-        // Check token balance changes for USDC transfers
-        if let Some(meta) = result["meta"].as_object() {
-            if let Some(pre_token_balances) = meta["preTokenBalances"].as_array() {
-                if let Some(post_token_balances) = meta["postTokenBalances"].as_array() {
-                    let usdc_mint = get_usdc_mint_for_network(network);
-                    
-                    for (pre_idx, pre_balance) in pre_token_balances.iter().enumerate() {
-                        if let Some(post_balance) = post_token_balances.get(pre_idx) {
-                            // Check if this is USDC transfer
-                            if let (Some(pre_mint), Some(post_mint)) = (
-                                pre_balance["mint"].as_str(),
-                                post_balance["mint"].as_str()
-                            ) {
-                                if pre_mint == usdc_mint && post_mint == usdc_mint {
-                                    if let (Some(pre_amount), Some(post_amount)) = (
-                                        pre_balance["uiTokenAmount"]["uiAmount"].as_f64(),
-                                        post_balance["uiTokenAmount"]["uiAmount"].as_f64()
-                                    ) {
-                                        let transferred = (post_amount - pre_amount).abs();
-                                        let expected_usdc = expected_amount;
-
-                                        let tolerance = expected_usdc * 0.05;
-                                        if (transferred - expected_usdc).abs() <= tolerance {
-                                            tracing::info!("Found USDC transfer of {} (expected {}, tolerance {}) on {}", 
-                                                          transferred, expected_usdc, tolerance, network);
-                                            return true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        match expected_token {
+            SupportedToken::Sol => {
+                check_sol_balance_changes(transaction, expected_amount, payment_reference)
+            }
+            SupportedToken::Usdc | SupportedToken::Usdt => {
+                let mint_address = expected_token.get_mint_address(network).unwrap();
+                check_spl_token_changes(transaction, expected_amount, mint_address, payment_reference)
             }
         }
+    } else {
+        false
     }
-
-    match expected_token {
-        SupportedToken::Sol => {
-            check_sol_balance_changes(transaction, expected_amount, payment_reference)
-        }
-        SupportedToken::Usdc | SupportedToken::Usdt => { 
-            let mint_address = expected_token.get_mint_address(network).unwrap();
-            check_spl_token_changes(transaction, expected_amount, mint_address, payment_reference)
-        }
-    };
-    
-    false
 }
 
 
