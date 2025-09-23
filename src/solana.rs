@@ -1,11 +1,42 @@
+use core::str;
+
 use uuid::Uuid;
 use serde_json::Value;
 use bigdecimal::ToPrimitive;
 use crate::{AppState, models::PaymentStatus};
 use base64::{Engine as _, engine::general_purpose};
+use serde::{Serialize, Deserialize};
 
 pub const DEVNET_USDC_MINT: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
 pub const MAINNET_USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+pub const DEVNET_USDT_MINT: &str = "EgEHQxJ8aPe7bsrR88zG3w3Y9N5CZg3w8d1K1CZg3w8d";
+pub const MAINNET_USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SupportedToken {
+    Usdc,
+    Usdt,
+    Sol,
+}
+
+impl SupportedToken {
+    pub fn get_mint_address(&self, network: &str) -> Option<&'static str> {
+        match (self, network.to_lowercase().as_str()) {
+            (SupportedToken::Usdc, "mainnet" | "mainnet-beta") => Some(MAINNET_USDC_MINT),
+            (SupportedToken::Usdc, _) => Some(DEVNET_USDC_MINT),
+            (SupportedToken::Usdt, "mainnet" | "mainnet-beta") => Some(MAINNET_USDT_MINT),
+            (SupportedToken::Usdt, _) => Some(DEVNET_USDT_MINT),
+            (SupportedToken::Sol, _) => None,
+        }
+    }
+
+    pub fn decimals(&self) -> u8 {
+        match self {
+            SupportedToken::Usdc | SupportedToken::Usdt => 6, 
+            SupportedToken::Sol => 9,
+        }
+    } 
+}
 
 pub fn get_usdc_mint_for_network(network: &str) -> &'static str {
     match network.to_lowercase().as_str() {
@@ -30,21 +61,31 @@ pub async fn generate_payment_qr(
     amount_usd: f64,
     recipient: &str,
     network: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { 
+    token: SupportedToken,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     validate_solana_address(recipient)?;
     
-    let amount_usdc = (amount_usd * 1_000_000.0) as u64;
-
-    let usdc_mint = get_usdc_mint_for_network(network);    
-
-    let solana_pay_url = format!(
-        "solana:{}?amount={}&spl-token={}&reference={}&label=ZendFi%20Payment&message=Payment%20{}",
-        recipient,
-        amount_usdc,
-        usdc_mint,
-        payment_id,
-        payment_id
-    );
+    let solana_pay_url = match token {
+        SupportedToken::Sol => {
+            // Native SOL transfer
+            let amount_lamports = (amount_usd * 1_000_000_000.0) as u64; // SOL has 9 decimals
+            format!(
+                "solana:{}?amount={}&reference={}&label=ZendFi%20Payment%20(SOL)&message=Payment%20{}",
+                recipient, amount_lamports, payment_id, payment_id
+            )
+        }
+        SupportedToken::Usdc | SupportedToken::Usdt => {
+            // SPL Token transfer
+            let amount_tokens = (amount_usd * 10_u64.pow(token.decimals() as u32) as f64) as u64;
+            let mint_address = token.get_mint_address(network)
+                .ok_or("Unsupported token for network")?;
+            
+            format!(
+                "solana:{}?amount={}&spl-token={}&reference={}&label=ZendFi%20Payment%20({:?})&message=Payment%20{}",
+                recipient, amount_tokens, mint_address, payment_id, token, payment_id
+            )
+        }
+    };
     
     Ok(solana_pay_url)
 }
@@ -202,7 +243,8 @@ async fn discover_payment_transaction(
                                 &tx_details, 
                                 &payment_id.to_string(), 
                                 expected_amount,
-                                &state.config.solana_network 
+                                &state.config.solana_network,
+                                SupportedToken::Usdc 
                             ) {
                                 tracing::info!("Found matching transaction {} for payment {}", signature, payment_id);
                                 return Ok(Some(signature.to_string()));
@@ -248,6 +290,7 @@ fn check_transaction_for_payment_reference(
     payment_reference: &str,
     expected_amount: f64,
     network: &str,
+    expected_token: SupportedToken,
 ) -> bool {
     if let Some(result) = transaction.get("result") {
         if result.is_null() {
@@ -267,6 +310,8 @@ fn check_transaction_for_payment_reference(
                 }
             }
         }
+
+        
 
         // Check instruction data for payment reference
         if let Some(transaction_obj) = result["transaction"].as_object() {
@@ -292,7 +337,6 @@ fn check_transaction_for_payment_reference(
         if let Some(meta) = result["meta"].as_object() {
             if let Some(pre_token_balances) = meta["preTokenBalances"].as_array() {
                 if let Some(post_token_balances) = meta["postTokenBalances"].as_array() {
-                    // ✅ FIX: Use network-aware USDC mint
                     let usdc_mint = get_usdc_mint_for_network(network);
                     
                     for (pre_idx, pre_balance) in pre_token_balances.iter().enumerate() {
@@ -325,7 +369,89 @@ fn check_transaction_for_payment_reference(
             }
         }
     }
+
+    match expected_token {
+        SupportedToken::Sol => {
+            check_sol_balance_changes(transaction, expected_amount, payment_reference)
+        }
+        SupportedToken::Usdc | SupportedToken::Usdt => { 
+            let mint_address = expected_token.get_mint_address(network).unwrap();
+            check_spl_token_changes(transaction, expected_amount, mint_address, payment_reference)
+        }
+    };
     
+    false
+}
+
+
+fn check_spl_token_changes(
+    transaction: &Value,
+    expected_amount: f64,
+    mint_address: &str,
+    _payment_reference: &str,
+) -> bool {
+    if let Some(meta) = transaction["result"]["meta"].as_object() {
+        if let Some(pre_token_balances) = meta["preTokenBalances"].as_array() {
+            if let Some(post_token_balances) = meta["postTokenBalances"].as_array() {
+                for (pre_idx, pre_balance) in pre_token_balances.iter().enumerate() {
+                    if let Some(post_balance) = post_token_balances.get(pre_idx) {
+                        // Check if this is the expected token transfer
+                        if let (Some(pre_mint), Some(post_mint)) = (
+                            pre_balance["mint"].as_str(),
+                            post_balance["mint"].as_str()
+                        ) {
+                            if pre_mint == mint_address && post_mint == mint_address {
+                                if let (Some(pre_amount), Some(post_amount)) = (
+                                    pre_balance["uiTokenAmount"]["uiAmount"].as_f64(),
+                                    post_balance["uiTokenAmount"]["uiAmount"].as_f64()
+                                ) {
+                                    let transferred = (post_amount - pre_amount).abs();
+                                    let tolerance = expected_amount * 0.05; // 5% tolerance
+
+                                    if (transferred - expected_amount).abs() <= tolerance {
+                                        tracing::info!("Found {} transfer of {} (expected {}, tolerance {})", 
+                                                      mint_address, transferred, expected_amount, tolerance);
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn check_sol_balance_changes(
+    transaction: &Value,
+    expected_amount: f64,
+    _payment_reference: &str,
+) -> bool {
+    if let Some(meta) = transaction["result"]["meta"].as_object() {
+        if let (Some(pre_balances), Some(post_balances)) = (
+            meta["preBalances"].as_array(),
+            meta["postBalances"].as_array()
+        ) {
+            for (i, pre_balance) in pre_balances.iter().enumerate() {
+                if let Some(post_balance) = post_balances.get(i) {
+                    if let (Some(pre_lamports), Some(post_lamports)) = (
+                        pre_balance.as_u64(),
+                        post_balance.as_u64()
+                    ) {
+                        let transferred_sol = (post_lamports as f64 - pre_lamports as f64) / 1_000_000_000.0;
+                        let tolerance = expected_amount * 0.05; // 5% tolerance
+                        
+                        if (transferred_sol - expected_amount).abs() <= tolerance {
+                            tracing::info!("Found SOL transfer of {} (expected {})", transferred_sol, expected_amount);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
     false
 }
 
@@ -384,7 +510,7 @@ mod tests {
         let amount_usd = 10.5;
         let recipient = "11111111111111111111111111111112";
         
-        let result = generate_payment_qr(&payment_id, amount_usd, recipient, "devnet").await;
+        let result = generate_payment_qr(&payment_id, amount_usd, recipient, "devnet", SupportedToken::Usdc).await;
         assert!(result.is_ok());
         
         let url = result.unwrap();

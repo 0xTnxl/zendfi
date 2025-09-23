@@ -42,11 +42,13 @@ pub enum PaymentStatus {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreatePaymentRequest {
     pub amount: f64,
-    pub currency: String,
+    pub currency: String, 
+    pub token: Option<String>,
     pub description: Option<String>,
     pub metadata: Option<serde_json::Value>,
     pub webhook_url: Option<String>,
     pub settlement_currency: Option<String>,
+    pub sol_settlement_preference: Option<String>, 
 }
 
 #[derive(Debug, Serialize, Deserialize)]

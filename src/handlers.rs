@@ -31,6 +31,12 @@ pub async fn create_payment(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let token = match request.token.as_deref() {
+        Some("USDT") => crate::solana::SupportedToken::Usdt,
+        Some("SOL") => crate::solana::SupportedToken::Sol,
+        _ => crate::solana::SupportedToken::Usdc, // Default
+    };
+
     // Convert NGN to USD if it's needed
     let (amount_usd, amount_ngn) = if request.currency == "NGN" {
         let rate = crate::exchange::get_current_rate(&state).await
@@ -53,11 +59,14 @@ pub async fn create_payment(
     let amount_usd_bd = BigDecimal::from_f64(amount_usd).unwrap();
     let amount_ngn_bd = amount_ngn.and_then(|n| BigDecimal::from_f64(n));
 
+    let token_string = format!("{:?}", token).to_uppercase();
+    
     let qr_code = crate::solana::generate_payment_qr(
         &payment_id,
         amount_usd,
         &state.config.recipient_wallet,
-        &state.config.solana_network 
+        &state.config.solana_network,
+        token
     ).await.map_err(|e| {
         tracing::error!("Failed to generate QR code: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -66,8 +75,9 @@ pub async fn create_payment(
     // Create a new payment
     sqlx::query!(
         r#"
-        INSERT INTO payments (id, merchant_id, amount_usd, amount_ngn, status, metadata, created_at, expires_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        INSERT INTO payments (id, merchant_id, amount_usd, amount_ngn, status, metadata, 
+                             payment_token, sol_settlement_preference, created_at, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
         payment_id,
         merchant.merchant_id,
@@ -75,6 +85,8 @@ pub async fn create_payment(
         amount_ngn_bd,
         PaymentStatus::Pending as PaymentStatus,
         request.metadata.unwrap_or(serde_json::json!({})),
+        token_string,
+        request.sol_settlement_preference,
         chrono::Utc::now(),
         expires_at
     )
@@ -459,8 +471,23 @@ pub async fn get_settlement_status(
     Path(payment_id): Path<Uuid>,
     Extension(merchant): Extension<AuthenticatedMerchant>,
 ) -> Result<Json<crate::settlements::Settlement>, StatusCode> {
-    let settlement = crate::settlements::get_settlement_status(&state, payment_id).await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let settlement = sqlx::query_as!(
+        crate::settlements::Settlement,
+        r#"SELECT id, payment_id, 
+                  COALESCE(payment_token, 'USDC') as "payment_token!: String",
+                  COALESCE(settlement_token, 'NGN') as "settlement_token!: String", 
+                  COALESCE(amount_recieved, 0) as "amount_recieved!: BigDecimal",
+                  COALESCE(amount_settled, amount_ngn) as "amount_settled!: BigDecimal",
+                  exchange_rate_used,
+                  sol_swap_signature,
+                  merchant_id, amount_ngn, bank_account, bank_code, 
+                  account_name, status, external_reference, provider, created_at, completed_at
+           FROM settlements WHERE payment_id = $1"#,
+        payment_id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| StatusCode::NOT_FOUND)?;
     
     // Verify merchant owns this settlement
     if settlement.merchant_id != merchant.merchant_id {
@@ -476,7 +503,14 @@ pub async fn list_settlements(
 ) -> Result<Json<Vec<crate::settlements::Settlement>>, StatusCode> {
     let settlements = sqlx::query_as!(
         crate::settlements::Settlement,
-        r#"SELECT id, payment_id, merchant_id, amount_ngn, bank_account, bank_code, 
+        r#"SELECT id, payment_id,
+                  COALESCE(payment_token, 'USDC') as "payment_token!: String",
+                  COALESCE(settlement_token, 'NGN') as "settlement_token!: String",
+                  COALESCE(amount_recieved, 0) as "amount_recieved!: BigDecimal", 
+                  COALESCE(amount_settled, amount_ngn) as "amount_settled!: BigDecimal",
+                  exchange_rate_used,
+                  sol_swap_signature,
+                  merchant_id, amount_ngn, bank_account, bank_code, 
                   account_name, status, external_reference, provider, created_at, completed_at
            FROM settlements 
            WHERE merchant_id = $1 

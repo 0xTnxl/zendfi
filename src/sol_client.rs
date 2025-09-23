@@ -57,7 +57,7 @@ impl ResilientSolanaClient {
         Self {
             endpoints,
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(15)) // ✅ INCREASED: Longer timeout
+                .timeout(Duration::from_secs(15))
                 .build()
                 .expect("Failed to create HTTP client"),
             circuit_breaker_threshold: 5,
