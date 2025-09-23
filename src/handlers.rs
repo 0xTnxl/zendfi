@@ -438,7 +438,62 @@ fn is_valid_nigerian_bank_code(bank_code: &str) -> bool {
 }
 
 async fn is_valid_webhook_url(url: &str) -> bool {
-    // Basic URL format validation
+    if !validate_webhook_url_format(url) {
+        return false;
+    }
+    
+    let env = std::env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string());
+    
+    match env.as_str() {
+        "development" | "test" => {
+            tracing::info!("Development mode: accepting webhook URL {}", url);
+            true
+        }
+        "staging" => {
+            is_testing_webhook_url(url) || perform_lightweight_webhook_check(url).await
+        }
+        "production" => {
+            if is_testing_webhook_url(url) {
+                tracing::warn!("Testing webhook URL in production: {}", url);
+                false
+            } else {
+                perform_production_webhook_check(url).await
+            }
+        }
+        _ => validate_webhook_url_format(url)
+    }
+}
+
+async fn perform_production_webhook_check(url: &str) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .user_agent("ZendFi-Webhook-Validator/1.0")
+        .build()
+        .unwrap();
+
+    match client.head(url).send().await {
+        Ok(response) => {
+            let status = response.status();
+            if status.is_success() || status.is_client_error() {
+                true
+            } else {
+                tracing::warn!("Webhook URL returned server error {}: {}", status, url);
+                false
+            }
+        }
+        Err(e) => {
+            if e.is_timeout() {
+                tracing::warn!("Webhook URL timeout (allowing): {}", url);
+                true 
+            } else {
+                tracing::error!("Webhook URL connection failed: {}: {}", url, e);
+                false 
+            }
+        }
+    }
+}
+
+fn validate_webhook_url_format(url: &str) -> bool {
     if !url.starts_with("https://") {
         tracing::warn!("Webhook URL must use HTTPS: {}", url);
         return false;
@@ -449,19 +504,49 @@ async fn is_valid_webhook_url(url: &str) -> bool {
         return false;
     }
 
+    if url.contains("localhost") || url.contains("127.0.0.1") || url.contains("192.168.") {
+        tracing::warn!("Webhook URL cannot be localhost or private IP: {}", url);
+        return false;
+    }
+
+    if url.len() > 2048 {
+        tracing::warn!("Webhook URL too long: {}", url);
+        return false;
+    }
+
+    true
+}
+
+fn is_testing_webhook_url(url: &str) -> bool {
+    let testing_domains = [
+        "webhook.site",
+        "webhooks.test",
+        "ngrok.io",
+        "ngrok.app", 
+        "localtunnel.me",
+        "requestbin.com",
+        "hookb.in",
+        "beeceptor.com"
+    ];
+    
+    testing_domains.iter().any(|domain| url.contains(domain))
+}
+
+
+async fn perform_lightweight_webhook_check(url: &str) -> bool {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(3))
         .build()
         .unwrap();
-        
-    match client.head(url).send().await {
-        Ok(response) => {
-            let status = response.status();
-            status.is_success() || status.is_client_error()
+
+    match client.get(url).send().await {
+        Ok(_) => {
+            tracing::info!("Webhook URL connectivity verified: {}", url);
+            true
         }
         Err(e) => {
-            tracing::warn!("Webhook URL connectivity test failed for {}: {}", url, e);
-            false
+            tracing::warn!("Webhook URL check failed (but allowing): {}: {}", url, e);
+            true 
         }
     }
 }
