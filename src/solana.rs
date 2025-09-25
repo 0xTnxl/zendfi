@@ -4,7 +4,7 @@ use uuid::Uuid;
 use serde_json::Value;
 use bigdecimal::ToPrimitive;
 use crate::{AppState, models::PaymentStatus};
-use base64::{Engine as _, engine::general_purpose};
+use base64::Engine;
 use serde::{Serialize, Deserialize};
 
 pub const DEVNET_USDC_MINT: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
@@ -12,7 +12,7 @@ pub const MAINNET_USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1
 pub const DEVNET_USDT_MINT: &str = "EgEHQxJ8aPe7bsrR88zG3w3Y9N5CZg3w8d1K1CZg3w8d";
 pub const MAINNET_USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum SupportedToken {
     Usdc,
     Usdt,
@@ -47,13 +47,6 @@ pub fn get_usdc_mint_for_network(network: &str) -> &'static str {
             DEVNET_USDC_MINT
         }
     }
-}
-
-// strictly in development mode
-// ngl, it's basically here for backward compatibility at this point
-#[allow(dead_code)]
-pub fn get_usdc_mint() -> &'static str {
-    DEVNET_USDC_MINT
 }
 
 pub async fn generate_payment_qr(
@@ -217,14 +210,29 @@ async fn discover_payment_transaction(
     payment_id: Uuid,
     expected_amount: f64,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let payment_info = sqlx::query!(
+        r#"SELECT COALESCE(payment_token, 'USDC') as payment_token 
+           FROM payments WHERE id = $1"#,
+        payment_id
+    )
+    .fetch_one(&state.db)
+    .await?;
+
+    let expected_token = match payment_info.payment_token.as_deref() {
+        Some("USDC") => SupportedToken::Usdc,
+        Some("USDT") => SupportedToken::Usdt,
+        Some("SOL") => SupportedToken::Sol,
+        _ => SupportedToken::Usdc,
+    };
+
+    tracing::info!("Monitoring for {} payment {} (amount: {})", 
+                   payment_info.payment_token.as_deref().unwrap_or("USDC"), payment_id, expected_amount);
+
     let response = state.solana_client.make_rpc_call(
         "getSignaturesForAddress",
         serde_json::json!([
             state.config.recipient_wallet,
-            {
-                "limit": 50,
-                "commitment": "confirmed"
-            }
+            { "limit": 50, "commitment": "confirmed" }
         ])
     ).await?;
     
@@ -244,9 +252,10 @@ async fn discover_payment_transaction(
                                 &payment_id.to_string(), 
                                 expected_amount,
                                 &state.config.solana_network,
-                                SupportedToken::Usdc 
+                                expected_token
                             ) {
-                                tracing::info!("Found matching transaction {} for payment {}", signature, payment_id);
+                                tracing::info!("Found matching {} transaction {} for payment {}", 
+                                             payment_info.payment_token.as_deref().unwrap_or("USDC"), signature, payment_id);
                                 return Ok(Some(signature.to_string()));
                             }
                         }

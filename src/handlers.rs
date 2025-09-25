@@ -26,7 +26,6 @@ pub async fn create_payment(
     Extension(merchant): Extension<AuthenticatedMerchant>,
     Json(request): Json<CreatePaymentRequest>,
 ) -> Result<Json<PaymentResponse>, StatusCode> {
-    // Validate amount first
     if request.amount <= 0.0 {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -34,10 +33,15 @@ pub async fn create_payment(
     let token = match request.token.as_deref() {
         Some("USDT") => crate::solana::SupportedToken::Usdt,
         Some("SOL") => crate::solana::SupportedToken::Sol,
-        _ => crate::solana::SupportedToken::Usdc, // Default
+        _ => crate::solana::SupportedToken::Usdc,
     };
 
-    // Convert NGN to USD if it's needed
+    tracing::info!("Creating {} payment for ${} {} (merchant: {})", 
+                   format!("{:?}", token).to_uppercase(), 
+                   request.amount, 
+                   request.currency,
+                   merchant.merchant_id);
+
     let (amount_usd, amount_ngn) = if request.currency == "NGN" {
         let rate = crate::exchange::get_current_rate(&state).await
             .map_err(|e| {
@@ -47,7 +51,6 @@ pub async fn create_payment(
         let usd_amount = request.amount / rate.usd_to_ngn;
         (usd_amount, Some(request.amount))
     } else {
-        // Assume USD
         let rate = crate::exchange::get_current_rate(&state).await
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let ngn_amount = request.amount * rate.usd_to_ngn;
@@ -66,13 +69,16 @@ pub async fn create_payment(
         amount_usd,
         &state.config.recipient_wallet,
         &state.config.solana_network,
-        token
+        token.clone()
     ).await.map_err(|e| {
         tracing::error!("Failed to generate QR code: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    
-    // Create a new payment
+
+    tracing::info!("Generated {} payment QR: {}",
+        format!("{:?}", token).to_uppercase(),
+        qr_code);
+
     sqlx::query!(
         r#"
         INSERT INTO payments (id, merchant_id, amount_usd, amount_ngn, status, metadata, 
@@ -97,7 +103,6 @@ pub async fn create_payment(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Trigger webhook for payment created
     let _ = create_webhook_event(&state, payment_id, WebhookEventType::PaymentCreated).await;
     
     Ok(Json(PaymentResponse {
@@ -108,6 +113,7 @@ pub async fn create_payment(
         qr_code,
         payment_url: format!("{}/pay/{}", state.config.frontend_url, payment_id),
         expires_at,
+        settlement_info: None,
     }))
 }
 
@@ -180,21 +186,18 @@ pub async fn create_merchant(
     State(state): State<AppState>,
     Json(request): Json<CreateMerchantRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // validate wallet address if provided
     if let Some(ref wallet_addr) = request.wallet_address {
         if crate::solana::validate_solana_address(wallet_addr).is_err() {
             return Err(StatusCode::BAD_REQUEST);
         }
     }
 
-    // validate bank code if provided
     if let Some(ref bank_code) = request.bank_code {
         if !is_valid_nigerian_bank_code(bank_code) {
             return Err(StatusCode::BAD_REQUEST);
         }
     }
 
-    // validate webhook URL if provided
     if let Some(ref webhook_url) = request.webhook_url {
         if !is_valid_webhook_url(webhook_url).await {
             tracing::warn!("Invalid webhook URL provided: {}", webhook_url);
@@ -202,16 +205,13 @@ pub async fn create_merchant(
         }
     }
 
-    // determine settlement preference
     let settlement_pref = request.settlement_preference
         .as_deref()
         .map(SettlementPreference::from)
         .unwrap_or(SettlementPreference::AutoNgn);
 
-    // validate the merchants inputs based on settlement preference
     match settlement_pref {
         SettlementPreference::AutoNgn | SettlementPreference::PerPayment => {
-            // Require bank details for NGN settlements
             if request.bank_account_number.is_none() || request.bank_code.is_none() {
                 return Err(StatusCode::BAD_REQUEST);
             }
@@ -222,15 +222,12 @@ pub async fn create_merchant(
     }
 
     let merchant_id = Uuid::new_v4();
-    
-    // use the provided wallet or generate new
+
     let (merchant_wallet, wallet_generated) = if let Some(provided_wallet) = request.wallet_address {
-        // Merchant provided their own wallet
         crate::solana::validate_solana_address(&provided_wallet)
             .map_err(|_| StatusCode::BAD_REQUEST)?;
         (provided_wallet, false)
     } else {
-        // Generate new wallet for merchant  
         let (wallet_pubkey, _keypair_path) = generate_merchant_wallet(&merchant_id, &state.config).await
         .map_err(|e| {
             tracing::error!("Failed to generate merchant wallet: {}", e);
@@ -315,8 +312,7 @@ async fn generate_merchant_wallet(
 
     let keypair_dir = &config.merchant_wallet_dir;
     std::fs::create_dir_all(keypair_dir)?;
-    
-    // Set directory permissions (owner read/write/execute only)
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -329,8 +325,7 @@ async fn generate_merchant_wallet(
     
     let encrypted_data = encrypt_keypair_data(&keypair_data.to_string(), merchant_id)?;
     std::fs::write(&keypair_path, encrypted_data)?;
-    
-    // Set file permissions (owner read/write only)
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -350,8 +345,7 @@ fn encrypt_keypair_data(data: &str, merchant_id: &Uuid) -> Result<String, Box<dy
     
     let salt = format!("zendfi_salt_{}", merchant_id);
     let argon2 = Argon2::default();
-    
-    // Derive 32-byte key for AES-256
+
     let mut derived_key = [0u8; 32];
     argon2.hash_password_into(
         master_key.as_bytes(),
@@ -566,15 +560,15 @@ pub async fn get_settlement_status(
                   exchange_rate_used,
                   sol_swap_signature,
                   merchant_id, amount_ngn, bank_account, bank_code, 
-                  account_name, status, external_reference, provider, created_at, completed_at
+                  account_name, status, batch_id, estimated_processing_time,
+                  external_reference, provider, created_at, completed_at
            FROM settlements WHERE payment_id = $1"#,
         payment_id
     )
     .fetch_one(&state.db)
     .await
     .map_err(|_| StatusCode::NOT_FOUND)?;
-    
-    // Verify merchant owns this settlement
+
     if settlement.merchant_id != merchant.merchant_id {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -596,7 +590,8 @@ pub async fn list_settlements(
                   exchange_rate_used,
                   sol_swap_signature,
                   merchant_id, amount_ngn, bank_account, bank_code, 
-                  account_name, status, external_reference, provider, created_at, completed_at
+                  account_name, status, batch_id, estimated_processing_time,
+                  external_reference, provider, created_at, completed_at
            FROM settlements 
            WHERE merchant_id = $1 
            ORDER BY created_at DESC 
@@ -617,11 +612,11 @@ pub async fn get_merchant_dashboard(
     let stats = sqlx::query!(
         r#"
         SELECT 
+            SUM(CASE WHEN status = 'confirmed' THEN COALESCE(amount_usd, 0) ELSE 0 END) as total_volume_usd,
+            SUM(CASE WHEN status = 'confirmed' THEN COALESCE(amount_ngn, 0) ELSE 0 END) as total_volume_ngn,
             COUNT(*) as total_transactions,
-            SUM(CASE WHEN status = 'confirmed' THEN 1 ELSE 0 END) as successful_transactions,
-            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_transactions,
-            SUM(CASE WHEN status = 'confirmed' THEN amount_usd ELSE 0 END) as total_volume_usd,
-            SUM(CASE WHEN status = 'confirmed' THEN COALESCE(amount_ngn, 0) ELSE 0 END) as total_volume_ngn
+            COUNT(CASE WHEN status = 'confirmed' THEN 1 END) as successful_transactions,
+            COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_transactions
         FROM payments 
         WHERE merchant_id = $1
         "#,
@@ -698,46 +693,48 @@ pub async fn system_health(State(state): State<AppState>) -> Json<serde_json::Va
 }
 
 async fn get_system_metrics(db: &sqlx::PgPool) -> serde_json::Value {
-    let (pending, confirmed, failed, payments_24h, payments_1h) = 
-        sqlx::query!(
-            r#"
-            SELECT 
-                COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_payments,
-                COUNT(CASE WHEN status = 'confirmed' THEN 1 END) as confirmed_payments,
-                COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_payments,
-                COUNT(CASE WHEN created_at > NOW() - INTERVAL '24 hours' THEN 1 END) as payments_24h,
-                COUNT(CASE WHEN created_at > NOW() - INTERVAL '1 hour' THEN 1 END) as payments_1h
-            FROM payments
-            "#
-        )
-        .fetch_optional(db)  
-        .await
-        .unwrap_or(None)
-        .map(|row| (
-            row.pending_payments.unwrap_or(0),
-            row.confirmed_payments.unwrap_or(0),
-            row.failed_payments.unwrap_or(0),
-            row.payments_24h.unwrap_or(0),
-            row.payments_1h.unwrap_or(0),
-        ))
-        .unwrap_or((0, 0, 0, 0, 0)); // Default to zeros if no data
+    let stats = sqlx::query!(
+        r#"
+        SELECT 
+            COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending,
+            COUNT(CASE WHEN status = 'confirmed' THEN 1 END) as confirmed,
+            COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed,
+            COUNT(CASE WHEN created_at > NOW() - INTERVAL '24 hours' THEN 1 END) as payments_24h,
+            COUNT(CASE WHEN created_at > NOW() - INTERVAL '1 hour' THEN 1 END) as payments_1h
+        FROM payments
+        "#
+    )
+    .fetch_optional(db)
+    .await
+    .unwrap_or(None);
 
-    serde_json::json!({
-        "payments": {
-            "pending": pending,
-            "confirmed": confirmed,
-            "failed": failed,
-            "last_24h": payments_24h,
-            "last_1h": payments_1h
-        }
-    })
+    if let Some(row) = stats {
+        serde_json::json!({
+            "payments": {
+                "pending": row.pending.unwrap_or(0),
+                "confirmed": row.confirmed.unwrap_or(0),
+                "failed": row.failed.unwrap_or(0),
+                "last_24h": row.payments_24h.unwrap_or(0),
+                "last_1h": row.payments_1h.unwrap_or(0)
+            }
+        })
+    } else {
+        serde_json::json!({
+            "payments": {
+                "pending": 0,
+                "confirmed": 0,
+                "failed": 0,
+                "last_24h": 0,
+                "last_1h": 0
+            }
+        })
+    }
 }
 
 async fn check_database_health(db: &sqlx::PgPool) -> bool {
     sqlx::query("SELECT 1").fetch_one(db).await.is_ok()
 }
 
-// Only available in development builds
 #[cfg(debug_assertions)] 
 pub async fn reset_database(
     State(state): State<AppState>,

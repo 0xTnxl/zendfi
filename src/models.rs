@@ -93,6 +93,14 @@ pub struct PaymentResponse {
     pub qr_code: String,
     pub payment_url: String,
     pub expires_at: DateTime<Utc>,
+    pub settlement_info: Option<SettlementInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SettlementInfo {
+    pub estimated_processing_time: DateTime<Utc>,
+    pub batch_schedule: String,
+    pub processing_message: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

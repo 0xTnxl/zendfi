@@ -7,8 +7,7 @@ pub async fn initialize_database(database_url: &str) -> Result<PgPool, sqlx::Err
         .acquire_timeout(std::time::Duration::from_secs(30))
         .connect(database_url)
         .await?;
-    
-    // Run the migrations that we have
+
     sqlx::migrate!("./migrations").run(&pool).await?;
     
     tracing::info!("Database initialized successfully");

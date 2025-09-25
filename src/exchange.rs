@@ -102,10 +102,9 @@ mod tests {
     
     #[tokio::test]
     async fn test_fetch_binance_rate() {
-        // This test would require internet connection
         if let Ok(rate) = fetch_binance_rate().await {
             assert!(rate > 0.0);
-            assert!(rate < 10000.0); // Reasonable bounds for USD/NGN
+            assert!(rate < 10000.0);
         }
     }
 }

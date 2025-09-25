@@ -39,6 +39,8 @@ pub enum WebhookEventType {
     PaymentConfirmed,
     PaymentFailed,
     PaymentExpired,
+    SettlementQueued,
+    SettlementProcessing,
     SettlementCompleted,
 }
 

@@ -34,7 +34,6 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -46,8 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting ZendFi Payment Gateway");
     
     let config = Config::from_env();
-    
-    // Database connection
+
     let db = database::initialize_database(&config.database_url).await?;
     
     let solana_client = Arc::new(sol_client::ResilientSolanaClient::new(
@@ -66,6 +64,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
     };
 
+    let batch_state = state.clone();
+    tokio::spawn(crate::settlements::start_settlement_batch_worker(batch_state));
+
     match test_solana_connection(&state.solana_rpc_url).await {
         Ok(_) => tracing::info!("Connected to Solana RPC"),
         Err(e) => tracing::warn!("Solana RPC connection issue: {}", e),
@@ -76,8 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let monitor_state = state.clone();
     tokio::spawn(solana::start_payment_monitor(monitor_state));
-    
-    // Public routes (no authentication required)
+
     let public_routes = Router::new()
         .route("/health", get(health_check))
         .route("/system/health", get(system_health))
@@ -86,8 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/merchants", post(create_merchant))
         .route("/api/v1/rates", get(get_exchange_rates))
         .with_state(state.clone());
-    
-    // Protected routes (require API key authentication)
+
     let protected_routes = Router::new()
         .route("/api/v1/payments", post(create_payment))
         .route("/api/v1/payments/:id", get(get_payment))
@@ -171,10 +170,10 @@ async fn cors_layer(request: Request, next: Next) -> Result<Response, StatusCode
 
 fn add_cors_headers(headers: &mut axum::http::HeaderMap, origin: &str) {
     let allowed_origins = [
-        "http://localhost:3000",    // React dev server
-        "http://localhost:5173",    // Vite dev server  
-        "http://localhost:8080",    // Alternative dev port
-        "https://your-frontend-domain.com", // I'll replace this with the original URL once it is ready
+        "http://localhost:3000",  
+        "http://localhost:5173",   
+        "http://localhost:8080",  
+        "https://your-frontend-domain.com", 
     ];
     
     if allowed_origins.contains(&origin) {
