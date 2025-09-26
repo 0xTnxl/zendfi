@@ -734,38 +734,6 @@ async fn check_database_health(db: &sqlx::PgPool) -> bool {
     sqlx::query("SELECT 1").fetch_one(db).await.is_ok()
 }
 
-#[cfg(debug_assertions)] 
-pub async fn reset_database(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let tables = [
-        "webhook_events",
-        "settlements", 
-        "api_keys",
-        "payments",
-        "merchants",
-        "exchange_rates"
-    ];
-    
-    for table in tables.iter() {
-        sqlx::query(&format!("TRUNCATE TABLE {} CASCADE", table))
-            .execute(&state.db)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to truncate table {}: {}", table, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-    }
-    
-    tracing::info!("Database reset completed - all tables cleared");
-    
-    Ok(Json(serde_json::json!({
-        "message": "Database reset successfully",
-        "tables_cleared": tables,
-        "timestamp": chrono::Utc::now()
-    })))
-}
-
 pub async fn health_check() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "healthy",
