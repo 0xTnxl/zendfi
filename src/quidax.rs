@@ -175,7 +175,6 @@ impl QuidaxClient {
         }
     }
 
-    // ✅ ESSENTIAL: Create swap quotations
     pub async fn create_swap_quotation(
         &self,
         from_currency: &str,
@@ -221,7 +220,6 @@ impl QuidaxClient {
         }
     }
 
-    // ✅ ESSENTIAL: Confirm swaps
     pub async fn confirm_swap(
         &self,
         quotation_id: &str,
@@ -346,7 +344,6 @@ impl QuidaxClient {
         }
     }
 
-    // ✅ USEFUL: Validate addresses before settlements
     pub async fn validate_address(
         &self,
         currency: &str,

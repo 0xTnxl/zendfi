@@ -89,7 +89,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let public_routes = Router::new()
         .route("/health", get(health_check))
         .route("/system/health", get(system_health))
-        .route("/dev/reset-database", post(handlers::reset_database))
         .route("/", get(root_handler))
         .route("/api/v1/merchants", post(create_merchant))
         .route("/api/v1/rates", get(get_exchange_rates))
