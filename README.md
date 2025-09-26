@@ -1,4 +1,4 @@
-Zendfi is a solana-based payment gateway specifically engineered for african developers and merchants. The core design processes multiple token payements, including SOL, USDC and USDT with optional settlement to NGN or USDC, it also features batch processing, real-time monitoring and extensive security
+Solapay is a solana-based payment gateway specifically engineered for african developers and merchants. The core design processes multiple token payements, including SOL, USDC and USDT with optional settlement to NGN or USDC, it also features batch processing, real-time monitoring and extensive security
 
 System Architecture
 Solapay employs a microservice architecture built on Rust/Axum with PostgreSQL persistence, designed for high availability and horizontal scaling:
