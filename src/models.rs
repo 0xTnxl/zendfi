@@ -55,13 +55,13 @@ pub struct CreatePaymentRequest {
 pub struct CreateMerchantRequest {
     pub name: String,
     pub email: String,
-    pub settlement_preference: Option<String>, // "auto_ngn", "auto_usdc", "per_payment"
-    pub wallet_address: Option<String>, // Optional: merchant's existing wallet
+    pub settlement_preference: Option<String>, 
+    pub wallet_address: Option<String>, 
     pub bank_account_number: Option<String>,
     pub bank_code: Option<String>, 
     pub account_name: Option<String>,
     pub business_address: String,
-    pub settlement_currency: Option<String>, // Backward compatibility
+    pub settlement_currency: Option<String>,
     
     pub webhook_url: Option<String>,
 }
@@ -79,7 +79,7 @@ impl From<&str> for SettlementPreference {
         match s.to_lowercase().as_str() {
             "auto_usdc" => SettlementPreference::AutoUsdc,
             "per_payment" => SettlementPreference::PerPayment,
-            _ => SettlementPreference::AutoNgn, // Default
+            _ => SettlementPreference::AutoNgn,
         }
     }
 }
@@ -110,6 +110,23 @@ pub struct ExchangeRate {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ManualSettlementItem {
+    pub id: Uuid,
+    pub payment_id: Uuid,
+    pub amount_ngn: BigDecimal,
+    pub bank_account: String,
+    pub bank_code: String,
+    pub account_name: String,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub estimated_processing_time: Option<DateTime<Utc>>,
+    pub amount_usd: BigDecimal,
+    pub payment_token: Option<String>,
+    pub merchant_name: String,
+    pub merchant_email: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MerchantDashboard {
     pub merchant_id: Uuid,
     pub total_volume_usd: f64,
@@ -129,4 +146,28 @@ pub struct WebhookPayload {
     pub transaction_signature: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Settlement {
+    pub id: Uuid,
+    pub payment_id: Uuid,
+    pub payment_token: String,
+    pub settlement_token: String,
+    pub amount_recieved: BigDecimal,
+    pub amount_settled: BigDecimal,
+    pub exchange_rate_used: Option<BigDecimal>,
+    pub sol_swap_signature: Option<String>,
+    pub merchant_id: Uuid,
+    pub amount_ngn: Option<BigDecimal>,
+    pub bank_account: Option<String>,
+    pub bank_code: Option<String>,
+    pub account_name: Option<String>,
+    pub status: String,
+    pub batch_id: Option<Uuid>,
+    pub estimated_processing_time: Option<DateTime<Utc>>,
+    pub external_reference: Option<String>,
+    pub provider: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
 }

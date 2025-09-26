@@ -239,9 +239,9 @@ pub async fn deliver_webhook(state: AppState, webhook_id: Uuid) {
 
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("Content-Type", "application/json".parse().unwrap());
-    headers.insert("X-ZendFi-Signature", signature.parse().unwrap());
-    headers.insert("X-ZendFi-Event", format!("{:?}", payload.event).parse().unwrap());
-    headers.insert("X-ZendFi-Delivery", webhook_id.to_string().parse().unwrap());
+    headers.insert("X-Solapay-Signature", signature.parse().unwrap());
+    headers.insert("X-Solapay-Event", format!("{:?}", payload.event).parse().unwrap());
+    headers.insert("X-Solapay-Delivery", webhook_id.to_string().parse().unwrap());
 
     let response = client
         .post(&webhook.webhook_url)

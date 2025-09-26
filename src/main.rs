@@ -8,6 +8,8 @@ use axum::{
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+
+
 mod auth;
 mod models;
 mod handlers;
@@ -15,6 +17,7 @@ mod solana;
 mod sol_client;
 mod settlements;
 mod database;
+mod quidax;
 mod exchange;
 mod config;
 mod webhooks;
@@ -37,12 +40,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "zendfi=debug,tower_http=debug".into()),
+                .unwrap_or_else(|_| "solapay=debug,tower_http=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("Starting ZendFi Payment Gateway");
+    tracing::info!("Starting Solapay Payment Gateway");
     
     let config = Config::from_env();
 
@@ -78,6 +81,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let monitor_state = state.clone();
     tokio::spawn(solana::start_payment_monitor(monitor_state));
 
+    let admin_routes = Router::new()
+        .route("/admin/settlements/pending", get(settlements::get_pending_manual_settlements))
+        .route("/admin/settlements/:id/complete", post(settlements::mark_settlement_completed))
+        .with_state(state.clone());
+
     let public_routes = Router::new()
         .route("/health", get(health_check))
         .route("/system/health", get(system_health))
@@ -103,13 +111,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Combine the routers
     let app = Router::new()
         .merge(public_routes)
+        .merge(admin_routes)
         .merge(protected_routes)
         .layer(middleware::from_fn(cors_layer));
     
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port))
         .await?;
         
-    tracing::info!("ZendFi API running on http://0.0.0.0:{}", config.port);
+    tracing::info!("Solapay API running on http://0.0.0.0:{}", config.port);
     tracing::info!("API Documentation: http://0.0.0.0:{}/", config.port);
     
     axum::serve(listener, app).await?;

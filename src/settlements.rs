@@ -3,6 +3,7 @@ use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use serde::{Deserialize, Serialize};
 use crate::{AppState, models::*};
 use crate::solana::get_usdc_mint_for_network;
+use crate::quidax::get_quidax_client;
 use chrono::Timelike;
 use solana_sdk::{
     signature::Keypair,
@@ -19,62 +20,37 @@ use spl_associated_token_account::{
 use std::str::FromStr;
 use std::fs;
 use solana_sdk::signature::Signer;
+use axum::{extract::{State, Path}, http::StatusCode, Json};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use reqwest::Client;
+use serde_json::Value;
 
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum BatchStatus {
-    Pending, 
-    Queued,
-    Processing,
-    Completed,
-    Failed,
-}
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Settlement {
-    pub id: Uuid,
-    pub payment_id: Uuid,
-    pub payment_token: String,
-    pub settlement_token: String,
-    pub amount_recieved: BigDecimal,
-    pub amount_settled: BigDecimal,
-    pub exchange_rate_used: Option<BigDecimal>,
-    pub sol_swap_signature: Option<String>,
-    pub merchant_id: Uuid,
-    pub amount_ngn: BigDecimal,
-    pub bank_account: String,
-    pub bank_code: String,
-    pub account_name: String,
-    pub status: String,
-    pub batch_id: Option<Uuid>,
-    pub estimated_processing_time: Option<chrono::DateTime<chrono::Utc>>,
-    pub external_reference: Option<String>,
-    pub provider: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
-}
+static PRICE_CACHE: once_cell::sync::Lazy<Arc<Mutex<(f64, Instant)>>> = 
+    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new((150.0, Instant::now() - Duration::from_secs(3600)))));
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SettlementBatch {
-    pub id: Uuid,
-    pub cycle_start: chrono::DateTime<chrono::Utc>,
-    pub status: String,
-    pub total_settlements: i32,
-    pub total_amount_ngn: BigDecimal,
-    pub processed_count: i32,
-    pub failed_count: i32,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+pub struct SettlementCompletionRequest {
+    pub quidax_reference: String,
+    pub completed_by: String,
+    pub notes: Option<String>,
 }
 
 pub async fn process_settlement(
     state: &AppState,
     payment_id: Uuid,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Get payment and merchant info
     let payment = sqlx::query!(
-        r#"SELECT id, merchant_id, amount_usd, amount_ngn, status as "status: PaymentStatus",
-                  COALESCE(payment_token, 'USDC') as payment_token,
-                  settlement_currency_override
-           FROM payments WHERE id = $1"#,
+        r#"SELECT p.id, p.merchant_id, p.amount_usd, p.amount_ngn, 
+                  p.status as "status: PaymentStatus", 
+                  COALESCE(p.payment_token, 'USDC') as payment_token,
+                  p.settlement_currency_override,
+                  m.settlement_preference, m.wallet_address,
+                  m.bank_account_number, m.bank_code, m.account_name, m.name
+           FROM payments p 
+           JOIN merchants m ON p.merchant_id = m.id 
+           WHERE p.id = $1"#,
         payment_id
     )
     .fetch_one(&state.db)
@@ -84,63 +60,127 @@ pub async fn process_settlement(
         return Err("Payment not confirmed".into());
     }
 
-    let merchant = sqlx::query!(
-        r#"SELECT id, bank_account_number, bank_code, account_name, settlement_currency, name,
-                  COALESCE(settlement_preference, 'auto_ngn') as settlement_preference,
-                  wallet_address
-           FROM merchants WHERE id = $1"#,
-        payment.merchant_id
-    )
-    .fetch_one(&state.db)
-    .await?;
-
     let amount_usd = payment.amount_usd.to_f64().unwrap_or(0.0);
     let payment_token = payment.payment_token.as_deref().unwrap_or("USDC");
+    
+    // Determine settlement type based on merchant preferences
+    let settlement_preference = payment.settlement_currency_override
+        .as_deref()
+        .or(payment.settlement_preference.as_deref())
+        .unwrap_or("auto_ngn");
 
-    match merchant.settlement_preference.as_deref().unwrap_or("auto_ngn") {
+    match settlement_preference {
         "auto_usdc" => {
-            tracing::info!("Processing USDC settlement for auto_usdc merchant {}", merchant.name);
-            process_crypto_settlement(state, payment_id, amount_usd, payment_token).await
-        }
-        "per_payment" => {
-            let target_currency = payment.settlement_currency_override
-                .as_deref()
-                .or(merchant.settlement_currency.as_deref())
-                .unwrap_or("NGN");
-            
-            if target_currency == "USDC" {
-                tracing::info!("Processing USDC settlement for per_payment merchant {} (payment override)", merchant.name);
-                process_crypto_settlement(state, payment_id, amount_usd, payment_token).await
-            } else {
-                tracing::info!("Processing NGN settlement for per_payment merchant {} (NGN chosen)", merchant.name);
-                process_ngn_settlement(
-                    state, 
-                    payment_id, 
-                    amount_usd, 
-                    payment_token,
-                    merchant.id,
-                    merchant.bank_account_number.unwrap_or_default(),
-                    merchant.bank_code.unwrap_or_default(),
-                    merchant.account_name.unwrap_or_default(),
-                    merchant.name
-                ).await
-            }
-        }
-        _ => {
-            tracing::info!("Processing NGN settlement for auto_ngn merchant {}", merchant.name);
-            process_ngn_settlement(
+            process_crypto_settlement(
                 state, 
                 payment_id, 
                 amount_usd, 
+                payment_token, 
+                payment.merchant_id,
+                &payment.wallet_address
+            ).await
+        }
+        _ => {
+            process_ngn_settlement(
+                state,
+                payment_id,
+                amount_usd,
                 payment_token,
-                merchant.id,
-                merchant.bank_account_number.unwrap_or_default(),
-                merchant.bank_code.unwrap_or_default(),
-                merchant.account_name.unwrap_or_default(),
-                merchant.name
+                payment.merchant_id,
+                payment.bank_account_number.unwrap_or_default(),
+                payment.bank_code.unwrap_or_default(),
+                payment.account_name.unwrap_or_default(),
+                payment.name
             ).await
         }
     }
+}
+
+async fn process_crypto_settlement(
+    state: &AppState,
+    payment_id: Uuid,
+    amount_usd: f64,
+    payment_token: &str,
+    merchant_id: Uuid,
+    merchant_wallet: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!("Processing crypto settlement: {} {} -> USDC", amount_usd, payment_token);
+
+    let quidax_client = get_quidax_client(state);
+
+    let is_valid_wallet = quidax_client.validate_address("usdc", merchant_wallet).await
+        .unwrap_or(false);
+    
+    if !is_valid_wallet {
+        return Err(format!("Invalid merchant wallet address: {}", merchant_wallet).into());
+    }
+
+
+    let final_usdc_amount = match payment_token {
+        "USDC" => {
+            tracing::info!("Direct USDC settlement: ${}", amount_usd);
+            amount_usd
+        }
+        "USDT" => {
+            tracing::info!("Converting USDT -> USDC via Quidax: ${}", amount_usd);
+            execute_quidax_swap(state, "USDT", "USDC", amount_usd).await?;
+            amount_usd 
+        }
+        "SOL" => {
+            tracing::info!("Converting SOL -> USDC via Quidax: ${}", amount_usd);
+            let sol_amount = amount_usd / get_sol_price().await?;
+            execute_quidax_swap(state, "SOL", "USDC", sol_amount).await?;
+            amount_usd * 0.995 
+        }
+        _ => return Err(format!("Unsupported payment token: {}", payment_token).into())
+    };
+
+    let (merchant_receives_usdc, _solapay_fee) = calculate_settlement_amounts(
+        state, 
+        final_usdc_amount,
+        "USDC"
+    ).await?;
+
+    if !check_escrow_balance(state, merchant_receives_usdc).await? {
+        return Err("Insufficient USDC balance in escrow wallet".into());
+    }
+
+    let settlement_id = Uuid::new_v4();
+
+    // Create settlement record
+    sqlx::query!(
+        r#"
+        INSERT INTO settlements 
+        (id, payment_id, payment_token, settlement_token, amount_recieved, amount_settled,
+         settlement_currency, recipient_wallet, merchant_id, status, provider, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'processing', 'solapay_escrow', $10)
+        "#,
+        settlement_id,
+        payment_id,
+        payment_token,
+        "USDC",
+        BigDecimal::from_f64(final_usdc_amount).unwrap(),
+        BigDecimal::from_f64(merchant_receives_usdc).unwrap(),
+        "USDC",
+        merchant_wallet,
+        merchant_id,
+        chrono::Utc::now()
+    )
+    .execute(&state.db)
+    .await?;
+
+    // Execute USDC transfer
+    process_usdc_wallet_transfer(state, settlement_id, merchant_receives_usdc, merchant_wallet).await?;
+
+    tracing::info!("Crypto settlement completed for payment {}", payment_id);
+
+    let _ = crate::webhooks::create_webhook_event(
+        state, 
+        payment_id, 
+        crate::webhooks::WebhookEventType::SettlementCompleted
+    ).await;
+
+    Ok(())
 }
 
 async fn process_ngn_settlement(
@@ -154,7 +194,13 @@ async fn process_ngn_settlement(
     account_name: String,
     merchant_name: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (settlement_amount_ngn, _zendfi_fee_ngn) = calculate_settlement_amounts(
+    tracing::info!("Processing NGN settlement: {} {} -> NGN", amount_usd, payment_token);
+
+    if payment_token != "USDC" {
+        execute_quidax_swap(state, payment_token, "USDC", amount_usd).await?;
+    }
+
+    let (settlement_amount_ngn, _solapay_fee_ngn) = calculate_settlement_amounts(
         state,
         amount_usd,
         "NGN"
@@ -167,9 +213,9 @@ async fn process_ngn_settlement(
         r#"
         INSERT INTO settlements 
         (id, payment_id, payment_token, settlement_token, amount_recieved, amount_settled,
-         merchant_id, amount_ngn, bank_account, bank_code, account_name, 
+         settlement_currency, merchant_id, amount_ngn, bank_account, bank_code, account_name, 
          status, provider, estimated_processing_time, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending_batch', 'quidax_batch', $12, $13)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending_manual', 'quidax_manual', $13, $14)
         "#,
         settlement_id,
         payment_id,
@@ -177,6 +223,7 @@ async fn process_ngn_settlement(
         "NGN",
         BigDecimal::from_f64(amount_usd).unwrap(),
         BigDecimal::from_f64(settlement_amount_ngn).unwrap(),
+        "NGN",
         merchant_id,
         BigDecimal::from_f64(settlement_amount_ngn).unwrap(),
         bank_account,  
@@ -189,9 +236,8 @@ async fn process_ngn_settlement(
     .await?;
 
     tracing::info!(
-        "NGN settlement {} queued for batch processing: ₦{:.2} to account {} ({}) - estimated processing: {}",
-        settlement_id, settlement_amount_ngn, bank_account, merchant_name, 
-        next_batch_time.format("%H:%M")
+        "NGN settlement {} queued for manual processing: ₦{:.2} to {} ({})",
+        settlement_id, settlement_amount_ngn, account_name, merchant_name
     );
 
     let _ = crate::webhooks::create_webhook_event(
@@ -203,300 +249,239 @@ async fn process_ngn_settlement(
     Ok(())
 }
 
-async fn calculate_next_batch_time() -> chrono::DateTime<chrono::Utc> {
-    let now = chrono::Utc::now();
-    let batch_interval_minutes = std::env::var("BATCH_INTERVAL_MINUTES")
-        .unwrap_or_else(|_| "30".to_string()) 
-        .parse::<i64>()
-        .unwrap_or(30);
+async fn execute_quidax_swap(
+    state: &AppState,
+    from_currency: &str,
+    to_currency: &str,
+    amount: f64,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let quidax_client = get_quidax_client(state);
 
-    let minutes_since_hour = now.minute() as i64;
-    let minutes_to_next_batch = batch_interval_minutes - (minutes_since_hour % batch_interval_minutes);
+    let network = match from_currency.to_uppercase().as_str() {
+        "USDT" => Some("solana"), // USDT SPL token on Solana
+        "USDC" => Some("solana"), // USDC SPL token on Solana  
+        "SOL" => Some("solana"),  // Native SOL on Solana
+        _ => Some("solana"), // Default to Solana for all tokens
+    };
     
-    now + chrono::Duration::minutes(minutes_to_next_batch)
-}
-
-pub async fn start_settlement_batch_worker(state: AppState) {
-    let batch_interval = std::env::var("BATCH_INTERVAL_MINUTES")
-        .unwrap_or_else(|_| "30".to_string())
-        .parse::<u64>()
-        .unwrap_or(30);
-
-    let mut interval = tokio::time::interval(
-        std::time::Duration::from_secs(batch_interval * 60)
-    );
+    let quidax_address = quidax_client.create_payment_address(
+        &from_currency.to_lowercase(),
+        network,
+    ).await?;
     
-    tracing::info!("Settlement batch worker started - processing every {} minutes", batch_interval);
+    tracing::info!("Created Quidax {} address: {}", from_currency, quidax_address.address);
+
+    let transfer_signature = transfer_crypto_to_quidax(
+        state,
+        from_currency,
+        amount,
+        &quidax_address.address,
+    ).await?;
     
-    loop {
-        interval.tick().await;
-        
-        if let Err(e) = process_settlement_batch(&state).await {
-            tracing::error!("Batch processing failed: {}", e);
-        }
-    }
-}
+    tracing::info!("Transferred {} {} to Quidax: tx {}", 
+                   amount, from_currency, transfer_signature);
 
-async fn process_settlement_batch(state: &AppState) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let batch_id = Uuid::new_v4();
-    let cycle_start = chrono::Utc::now();
+    wait_for_quidax_deposit_confirmation(state, &quidax_address.id, amount, 60).await?;
+
+    let quotation = quidax_client.create_swap_quotation(
+        &from_currency.to_lowercase(),
+        &to_currency.to_lowercase(),
+        amount
+    ).await?;
+
+    let _swap_result = quidax_client.confirm_swap(&quotation.id).await?;
+
+    wait_for_quidax_swap_completion(state, &quotation.id, 30).await?;
     
-    tracing::info!("Starting settlement batch {} at {}", batch_id, cycle_start.format("%H:%M:%S"));
-
-    let pending_settlements = sqlx::query!(
-        r#"SELECT id, merchant_id, amount_ngn, bank_account, bank_code, account_name, payment_id
-           FROM settlements 
-           WHERE status = 'pending_batch' AND created_at <= NOW() - INTERVAL '1 minute'
-           ORDER BY created_at ASC
-           LIMIT 100"#
-    )
-    .fetch_all(&state.db)
-    .await?;
-
-    if pending_settlements.is_empty() {
-        tracing::info!("No settlements to process in this batch");
-        return Ok(());
-    }
-
-    let total_amount: f64 = pending_settlements
-        .iter()
-        .map(|s| s.amount_ngn.to_f64().unwrap_or(0.0))
-        .sum();
-
-    sqlx::query!(
-        r#"INSERT INTO settlement_batches 
-           (id, cycle_start, status, total_settlements, total_amount_ngn, processed_count, failed_count, created_at)
-           VALUES ($1, $2, 'processing', $3, $4, 0, 0, $5)"#,
-        batch_id,
-        cycle_start,
-        pending_settlements.len() as i32,
-        BigDecimal::from_f64(total_amount).unwrap(),
-        cycle_start
-    )
-    .execute(&state.db)
-    .await?;
-
-    let settlement_ids: Vec<Uuid> = pending_settlements.iter().map(|s| s.id).collect();
-    
-    sqlx::query!(
-        r#"UPDATE settlements 
-           SET status = 'batch_processing', batch_id = $1 
-           WHERE id = ANY($2)"#,
-        batch_id,
-        &settlement_ids
-    )
-    .execute(&state.db)
-    .await?;
-
     tracing::info!(
-        "Processing batch {} with {} settlements (₦{:.2} total)",
-        batch_id, pending_settlements.len(), total_amount
+        "Quidax swap completed: {} {} -> {} {} (quotation: {})",
+        amount, from_currency, quotation.to_amount, to_currency, quotation.id
     );
-    let mut processed_count = 0;
-    let mut failed_count = 0;
+    
+    Ok(quotation.id)
+}
 
-    for settlement in pending_settlements {
-        // Extract field values from the Record
-        let settlement_id = settlement.id;
-        let payment_id = settlement.payment_id;
-        let amount_ngn = settlement.amount_ngn.to_f64().unwrap_or(0.0);
-        let bank_account = settlement.bank_account.clone();
-        let bank_code = settlement.bank_code;
-        let account_name = settlement.account_name;
+async fn transfer_crypto_to_quidax(
+    state: &AppState,
+    currency: &str,
+    amount: f64,
+    quidax_address: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use solana_sdk::{signature::Keypair, pubkey::Pubkey, transaction::Transaction};
+    use solana_client::rpc_client::RpcClient;
+    use spl_token::instruction as token_instruction;
+    use spl_associated_token_account::get_associated_token_address;
+    use std::str::FromStr;
+    use std::fs;
+    
+    let keypair_path = state.config.wallet_keypair_path
+        .as_ref()
+        .ok_or("Escrow wallet keypair path not configured")?;
+    
+    let keypair_bytes = fs::read(keypair_path)?;
+    let mut keypair_array = [0u8; 64];
+    keypair_array.copy_from_slice(&keypair_bytes);
+    let escrow_keypair = Keypair::try_from(&keypair_array[..])?;
+    
+    let rpc_client = RpcClient::new(&state.solana_rpc_url);
+    let recipient_pubkey = Pubkey::from_str(quidax_address)?;
+    
+    match currency.to_uppercase().as_str() {
+        "SOL" => {
+            // Native SOL transfer
+            let lamports = (amount * 1_000_000_000.0) as u64;
+            let transfer_ix = solana_sdk::system_instruction::transfer(
+                &escrow_keypair.pubkey(),
+                &recipient_pubkey,
+                lamports,
+            );
+            
+            let recent_blockhash = rpc_client.get_latest_blockhash()?;
+            let transaction = Transaction::new_signed_with_payer(
+                &[transfer_ix],
+                Some(&escrow_keypair.pubkey()),
+                &[&escrow_keypair],
+                recent_blockhash,
+            );
+            
+            let signature = rpc_client.send_and_confirm_transaction(&transaction)?;
+            Ok(signature.to_string())
+        }
+        "USDC" | "USDT" => {
+            // SPL Token transfer
+            let mint_address = match currency {
+                "USDC" => get_usdc_mint_for_network(&state.config.solana_network),
+                "USDT" => "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // Mainnet USDT
+                _ => return Err("Unsupported token".into())
+            };
+            
+            let token_mint = Pubkey::from_str(mint_address)?;
+            let amount_tokens = (amount * 1_000_000.0) as u64; // 6 decimals for USDC/USDT
+            
+            let escrow_ata = get_associated_token_address(&escrow_keypair.pubkey(), &token_mint);
+            let recipient_ata = get_associated_token_address(&recipient_pubkey, &token_mint);
+            
+            let mut instructions = Vec::new();
+            
+            // Create recipient ATA if needed
+            if rpc_client.get_account(&recipient_ata).is_err() {
+                let create_ata_ix = spl_associated_token_account::instruction::create_associated_token_account(
+                    &escrow_keypair.pubkey(),
+                    &recipient_pubkey,
+                    &token_mint,
+                    &spl_token::id(),
+                );
+                instructions.push(create_ata_ix);
+            }
+            
+            // Transfer tokens
+            let transfer_ix = token_instruction::transfer(
+                &spl_token::id(),
+                &escrow_ata,
+                &recipient_ata,
+                &escrow_keypair.pubkey(),
+                &[&escrow_keypair.pubkey()],
+                amount_tokens,
+            )?;
+            instructions.push(transfer_ix);
+            
+            let recent_blockhash = rpc_client.get_latest_blockhash()?;
+            let transaction = Transaction::new_signed_with_payer(
+                &instructions,
+                Some(&escrow_keypair.pubkey()),
+                &[&escrow_keypair],
+                recent_blockhash,
+            );
+            
+            let signature = rpc_client.send_and_confirm_transaction(&transaction)?;
+            Ok(signature.to_string())
+        }
+        _ => Err(format!("Unsupported currency: {}", currency).into())
+    }
+}
 
-        match process_individual_settlement_in_batch(
-            state,
-            settlement_id,
-            payment_id,
-            amount_ngn,
-            bank_account,
-            bank_code,
-            account_name,
-            batch_id,
-        ).await {
-            Ok(_) => {
-                processed_count += 1;
-                tracing::info!("Processed settlement {} to {}", 
-                             settlement_id, settlement.bank_account);
+async fn wait_for_quidax_deposit_confirmation(
+    state: &AppState,
+    currency: &str,
+    expected_amount: f64,
+    timeout_seconds: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let quidax_client = get_quidax_client(state);
+    let start_time = std::time::Instant::now();
+    let timeout_duration = std::time::Duration::from_secs(timeout_seconds);
+    
+    // Get initial balance
+    let initial_balance = quidax_client.get_wallet_balance(currency).await
+        .unwrap_or(0.0);
+    
+    tracing::info!("Waiting for {} {} deposit. Initial balance: {}", 
+                   expected_amount, currency, initial_balance);
+    
+    while start_time.elapsed() < timeout_duration {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        
+        match quidax_client.get_wallet_balance(currency).await {
+            Ok(current_balance) => {
+                let received_amount = current_balance - initial_balance;
+                
+                tracing::debug!("Current {} balance: {} (received: {})", 
+                               currency, current_balance, received_amount);
+                
+                // Allow 1% tolerance for the deposit amount
+                if received_amount >= expected_amount * 0.99 {
+                    tracing::info!("Deposit confirmed: {} {} received", received_amount, currency);
+                    return Ok(());
+                }
             }
             Err(e) => {
-                failed_count += 1;
-                tracing::error!("Failed settlement {}: {}", settlement_id, e);
+                tracing::warn!("Error checking {} wallet balance: {}", currency, e);
             }
         }
     }
-
-    // Complete batch
-    let cycle_end = chrono::Utc::now();
-    let batch_status = if failed_count == 0 { "completed" } else { "partial" };
-
-    sqlx::query!(
-        r#"UPDATE settlement_batches 
-           SET status = $1, cycle_end = $2, processed_count = $3, failed_count = $4, completed_at = $5
-           WHERE id = $6"#,
-        batch_status,
-        cycle_end,
-        processed_count,
-        failed_count,
-        cycle_end,
-        batch_id
-    )
-    .execute(&state.db)
-    .await?;
-
-    tracing::info!(
-        "Batch {} completed: {}/{} successful, {} failed (took {}s)",
-        batch_id, processed_count, processed_count + failed_count, failed_count,
-        (cycle_end - cycle_start).num_seconds()
-    );
-
-    Ok(())
+    
+    Err(format!("Deposit confirmation timeout after {}s", timeout_seconds).into())
 }
 
-async fn process_individual_settlement_in_batch(
+async fn wait_for_quidax_swap_completion(
     state: &AppState,
-    settlement_id: Uuid,
-    payment_id: Uuid,
-    amount_ngn: f64,
-    bank_account: String,
-    bank_code: String,
-    account_name: String,
-    batch_id: Uuid,
+    quotation_id: &str,
+    timeout_seconds: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // This is where manual processing happens
-    sqlx::query!(
-        r#"UPDATE settlements 
-           SET status = 'ready_for_manual_processing',
-               provider_response = $1,
-               completed_at = $2
-           WHERE id = $3"#,
-        serde_json::json!({
-            "status": "ready_for_quidax_manual_withdrawal",
-            "batch_id": batch_id,
-            "amount_ngn": amount_ngn,
-            "bank_details": {
-                "account_number": bank_account,
-                "bank_code": bank_code,
-                "account_name": account_name
-            },
-            "instructions": format!("Process NGN withdrawal of ₦{:.2} to {} ({})", amount_ngn, account_name, bank_account)
-        }),
-        chrono::Utc::now(),
-        settlement_id
-    )
-    .execute(&state.db)
-    .await?;
-
-    // Send webhook for settlement ready for processing
-    let _ = crate::webhooks::create_webhook_event(
-        state, 
-        payment_id, 
-        crate::webhooks::WebhookEventType::SettlementProcessing
-    ).await;
-
-    tracing::info!("Settlement {} ready for manual Quidax processing: ₦{:.2} to {}", 
-                   settlement_id, amount_ngn, account_name);
-
-    Ok(())
-}
-
-async fn process_crypto_settlement(
-    state: &AppState,
-    payment_id: Uuid,
-    amount_usd: f64,
-    payment_token: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let merchant = sqlx::query!(
-        r#"SELECT id, wallet_address, name FROM merchants 
-           WHERE id = (SELECT merchant_id FROM payments WHERE id = $1)"#,
-        payment_id
-    )
-    .fetch_one(&state.db)
-    .await?;
-
-    let merchant_wallet = &merchant.wallet_address;
-
-    // Handle different payment tokens -> USDC settlement
-    let (final_usdc_amount, swap_signature) = match payment_token {
-        "USDC" => {
-            tracing::info!("Direct USDC settlement: ${}", amount_usd);
-            (amount_usd, None)
+    let quidax_client = get_quidax_client(state);
+    let start_time = std::time::Instant::now();
+    let timeout_duration = std::time::Duration::from_secs(timeout_seconds);
+    
+    tracing::info!("Waiting for Quidax swap {} to complete", quotation_id);
+    
+    while start_time.elapsed() < timeout_duration {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        
+        // Check swap transaction status using get_swap_transaction
+        match quidax_client.get_swap_transaction(quotation_id).await {
+            Ok(swap_status) => {
+                match swap_status["status"].as_str() {
+                    Some("completed") | Some("success") => {
+                        tracing::info!("✅ Swap {} completed successfully", quotation_id);
+                        return Ok(());
+                    }
+                    Some("failed") | Some("error") => {
+                        return Err(format!("Swap {} failed", quotation_id).into());
+                    }
+                    Some(status) => {
+                        tracing::debug!("Swap {} status: {}", quotation_id, status);
+                    }
+                    None => {
+                        tracing::debug!("Swap {} status unknown", quotation_id);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Error checking swap status: {}", e);
+            }
         }
-        "USDT" => {
-            tracing::info!("Converting USDT -> USDC: ${}", amount_usd);
-            let swap_sig = execute_usdt_to_usdc_swap(state, amount_usd).await?;
-            (amount_usd, Some(swap_sig))
-        }
-        "SOL" => {
-            tracing::info!("Converting SOL -> USDC: ${}", amount_usd);
-            let sol_price = get_sol_usdc_rate().await?;
-            let sol_amount = amount_usd / sol_price;
-            let swap_sig = execute_sol_to_usdc_swap(state, sol_amount, amount_usd * 0.995).await?;
-            (amount_usd * 0.995, Some(swap_sig))
-        }
-        _ => (amount_usd, None)
-    };
-
-    let (merchant_receives_usdc, _zendfi_fee) = calculate_settlement_amounts( 
-        state, 
-        final_usdc_amount, 
-        "USDC"
-    ).await?;
-
-    if !check_escrow_balance(state, merchant_receives_usdc).await? {
-        return Err("Insufficient USDC balance in escrow wallet".into());
     }
-
-    let settlement_id = Uuid::new_v4();
-
-    sqlx::query!(
-        r#"
-        INSERT INTO settlements 
-        (id, payment_id, payment_token, settlement_token, amount_recieved, amount_settled,
-         sol_swap_signature, merchant_id, amount_ngn, bank_account, bank_code, account_name, 
-         status, provider, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending', 'crypto_transfer', $13)
-        "#,
-        settlement_id,
-        payment_id,
-        payment_token,
-        "USDC", 
-        BigDecimal::from_f64(final_usdc_amount).unwrap(),
-        BigDecimal::from_f64(merchant_receives_usdc).unwrap(),
-        swap_signature,
-        merchant.id,
-        BigDecimal::from_f64(0.0).unwrap(),
-        merchant_wallet, 
-        "CRYPTO", 
-        merchant.name,
-        chrono::Utc::now()
-    )
-    .execute(&state.db)
-    .await?;
-
-    tracing::info!(
-        "Crypto settlement created: {} {} -> ${:.6} USDC to wallet {} (merchant: {})",
-        payment_token, final_usdc_amount, merchant_receives_usdc, merchant_wallet, merchant.name
-    );
-
-    // Execute the actual USDC transfer to merchant wallet
-    process_usdc_wallet_transfer_with_retry(
-        state,
-        settlement_id, 
-        merchant_receives_usdc,
-        merchant_wallet,
-        3 
-    ).await?;
-
-    tracing::info!("Crypto settlemnt completed for payment {}", payment_id);
-
-    let _ = crate::webhooks::create_webhook_event(
-        state, 
-        payment_id, 
-        crate::webhooks::WebhookEventType::SettlementCompleted
-    ).await;
-
-    Ok(())
+    
+    Err(format!("Swap completion timeout after {}s", timeout_seconds).into())
 }
 
 async fn process_usdc_wallet_transfer(
@@ -510,69 +495,48 @@ async fn process_usdc_wallet_transfer(
         .ok_or("Escrow wallet keypair path not configured")?;
     
     let keypair_bytes = fs::read(keypair_path)?;
-
-    if keypair_bytes.len() != 64 {
-        return Err("Invalid keypair file length".into());
-    }
-    
     let mut keypair_array = [0u8; 64];
     keypair_array.copy_from_slice(&keypair_bytes);
     let escrow_keypair = Keypair::try_from(&keypair_array[..])?;
 
-    tracing::info!("Loaded escrow wallet: {}", escrow_keypair.pubkey());
-
     let rpc_client = RpcClient::new(&state.solana_rpc_url);
-
     let recipient_pubkey = Pubkey::from_str(merchant_wallet)?;
     let usdc_mint = Pubkey::from_str(&get_usdc_mint_for_network(&state.config.solana_network))?;
 
     let usdc_amount_tokens = (usdc_amount * 1_000_000.0) as u64;
-
-    tracing::info!(
-        "Preparing USDC transfer: ${:.6} ({} tokens) to {}",
-        usdc_amount, usdc_amount_tokens, merchant_wallet
-    );
-
     let escrow_ata = get_associated_token_address(&escrow_keypair.pubkey(), &usdc_mint);
     let recipient_ata = get_associated_token_address(&recipient_pubkey, &usdc_mint);
 
-    tracing::info!("Escrow ATA: {}", escrow_ata);
-    tracing::info!("Recipient ATA: {}", recipient_ata);
-
     let mut instructions = Vec::new();
 
-    match rpc_client.get_account(&recipient_ata) {
-        Ok(_) => {
-            tracing::info!("Recipient ATA already exists");
-        }
-        Err(_) => {
-            tracing::info!("Creating recipient ATA");
-            let create_ata_ix = ata_instruction::create_associated_token_account(
-                &escrow_keypair.pubkey(), 
-                &recipient_pubkey,    
-                &usdc_mint,        
-                &spl_token::id(),   
-            );
-            instructions.push(create_ata_ix);
-        }
+    // Create recipient ATA if needed
+    if rpc_client.get_account(&recipient_ata).is_err() {
+        let create_ata_ix = ata_instruction::create_associated_token_account(
+            &escrow_keypair.pubkey(),
+            &recipient_pubkey,
+            &usdc_mint,
+            &spl_token::id(),
+        );
+        instructions.push(create_ata_ix);
     }
 
+    // Transfer USDC
     let transfer_ix = token_instruction::transfer(
-        &spl_token::id(),  
-        &escrow_ata,  
-        &recipient_ata,  
-        &escrow_keypair.pubkey(), 
+        &spl_token::id(),
+        &escrow_ata,
+        &recipient_ata,
+        &escrow_keypair.pubkey(),
         &[&escrow_keypair.pubkey()],
         usdc_amount_tokens,     
     )?;
     instructions.push(transfer_ix);
 
-    let memo_data = format!("ZendFi settlement: {}", settlement_id);
+    // Add memo
+    let memo_data = format!("Solapay settlement: {}", settlement_id);
     let memo_ix = create_memo_instruction(&memo_data);
     instructions.push(memo_ix);
 
     let recent_blockhash = rpc_client.get_latest_blockhash()?;
-    
     let transaction = Transaction::new_signed_with_payer(
         &instructions,
         Some(&escrow_keypair.pubkey()),
@@ -580,32 +544,13 @@ async fn process_usdc_wallet_transfer(
         recent_blockhash,
     );
 
-    tracing::info!("Sending USDC transfer transaction...");
+    let signature = rpc_client.send_and_confirm_transaction(&transaction)?;
     
-    let signature = rpc_client.send_and_confirm_transaction_with_spinner(&transaction)?;
-    
-    tracing::info!("USDC transfer completed! Signature: {}", signature);
-
+    // Update settlement record
     sqlx::query!(
-        r#"
-        UPDATE settlements 
-        SET status = 'completed',
-            provider_response = $1,
-            sol_swap_signature = $2,
-            completed_at = $3
-        WHERE id = $4
-        "#,
-        serde_json::json!({
-            "status": "completed",
-            "transfer_type": "usdc_wallet",
-            "amount_usdc": usdc_amount,
-            "amount_tokens": usdc_amount_tokens,
-            "recipient_wallet": merchant_wallet,
-            "recipient_ata": recipient_ata.to_string(),
-            "escrow_ata": escrow_ata.to_string(),
-            "provider": "solana_spl_transfer",
-            "transaction_signature": signature.to_string()
-        }),
+        r#"UPDATE settlements 
+           SET status = 'completed', transaction_signature = $1, completed_at = $2
+           WHERE id = $3"#,
         signature.to_string(),
         chrono::Utc::now(),
         settlement_id
@@ -613,28 +558,188 @@ async fn process_usdc_wallet_transfer(
     .execute(&state.db)
     .await?;
 
-    if let Ok(payment_id) = get_payment_id_from_settlement(state, settlement_id).await {
-        let _ = crate::webhooks::create_webhook_event(
-            state, 
-            payment_id, 
-            crate::webhooks::WebhookEventType::SettlementCompleted
-        ).await;
-    }
-
-    tracing::info!(
-        "USDC settlement completed: ${:.6} USDC to {} (tx: {})", 
-        usdc_amount, merchant_wallet, signature
-    );
-
+    tracing::info!("USDC transfer completed! Signature: {}", signature);
     Ok(())
 }
 
 fn create_memo_instruction(memo: &str) -> Instruction {
     Instruction {
-        program_id: Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr").unwrap(), // Memo program ID
+        program_id: spl_memo::id(),
         accounts: vec![],
         data: memo.as_bytes().to_vec(),
     }
+}
+
+async fn check_escrow_balance(
+    state: &AppState,
+    required_usdc: f64,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let keypair_path = state.config.wallet_keypair_path
+        .as_ref()
+        .ok_or("Escrow wallet keypair path not configured")?;
+    
+    let keypair_bytes = fs::read(keypair_path)?;
+    let mut keypair_array = [0u8; 64];
+    keypair_array.copy_from_slice(&keypair_bytes);
+    let escrow_keypair = Keypair::try_from(&keypair_array[..])?;
+    
+    let rpc_client = RpcClient::new(&state.solana_rpc_url);
+    let usdc_mint = Pubkey::from_str(&get_usdc_mint_for_network(&state.config.solana_network))?;
+    let escrow_ata = get_associated_token_address(&escrow_keypair.pubkey(), &usdc_mint);
+    
+    match rpc_client.get_token_account_balance(&escrow_ata) {
+        Ok(balance) => {
+            let current_balance = balance.ui_amount.unwrap_or(0.0);
+            tracing::info!("Escrow USDC balance: {}, required: {}", current_balance, required_usdc);
+            Ok(current_balance >= required_usdc)
+        }
+        Err(e) => {
+            tracing::error!("Failed to get escrow balance: {}", e);
+            Ok(false)
+        }
+    }
+}
+
+async fn calculate_next_batch_time() -> chrono::DateTime<chrono::Utc> {
+    let now = chrono::Utc::now();
+    let batch_interval_minutes = 30; // Fixed 30-minute intervals
+    let minutes_since_hour = now.minute() as i64;
+    let minutes_to_next_batch = batch_interval_minutes - (minutes_since_hour % batch_interval_minutes);
+    
+    now + chrono::Duration::minutes(minutes_to_next_batch)
+}
+
+async fn calculate_settlement_amounts(
+    state: &AppState,
+    amount_usd: f64,
+    settlement_currency: &str,
+) -> Result<(f64, f64), Box<dyn std::error::Error + Send + Sync>> {
+    let solapay_fee_rate = 0.029; // 2.9% fee
+    
+    if settlement_currency == "NGN" {
+        let rate = crate::exchange::get_current_rate(state).await?;
+        let gross_ngn = amount_usd * rate.usd_to_ngn;
+        let fee_ngn = gross_ngn * solapay_fee_rate;
+        let merchant_receives = gross_ngn - fee_ngn;
+        Ok((merchant_receives, fee_ngn))
+    } else {
+        // USDC settlement
+        let fee_usd = amount_usd * solapay_fee_rate;
+        let merchant_receives = amount_usd - fee_usd;
+        Ok((merchant_receives, fee_usd))
+    }
+}
+
+async fn get_sol_price() -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
+    {
+        let cache = PRICE_CACHE.lock().unwrap();
+        if cache.1.elapsed() < Duration::from_secs(300) { // 5 minutes
+            tracing::debug!("Using cached SOL price: ${:.2}", cache.0);
+            return Ok(cache.0);
+        }
+    }
+    
+    let client = Client::new();
+    let url = "https://lite-api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112";
+    
+    let response = client
+        .get(url)
+        .header("User-Agent", "Solapay/1.0")
+        .send()
+        .await?;
+    
+    if !response.status().is_success() {
+        tracing::warn!("Jupiter API request failed, using fallback price");
+        return Ok(150.0); // Fallback price
+    }
+    
+    let json: Value = response.json().await?;
+
+    if let Some(sol_data) = json.get("So11111111111111111111111111111111111111112") {
+        if let Some(usd_price) = sol_data.get("usdPrice").and_then(|v| v.as_f64()) {
+            tracing::info!("Retrieved SOL price from Jupiter: ${:.2}", usd_price);
+            return Ok(usd_price);
+        }
+    }
+    
+    tracing::warn!("Could not parse Jupiter API response, using fallback price");
+    Ok(150.0) // Fallback if parsing fails
+}
+
+pub async fn get_pending_manual_settlements(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ManualSettlementItem>>, StatusCode> {
+    let settlements = sqlx::query_as!(
+        ManualSettlementItem,
+        r#"
+        SELECT s.id, s.payment_id, 
+               COALESCE(s.amount_ngn, 0) as "amount_ngn!: BigDecimal", 
+               COALESCE(s.bank_account, '') as "bank_account!: String", 
+               COALESCE(s.bank_code, '') as "bank_code!: String", 
+               COALESCE(s.account_name, '') as "account_name!: String", 
+               s.status, s.created_at, s.estimated_processing_time,
+               s.amount_recieved as "amount_usd!: BigDecimal", 
+               s.payment_token, 
+               m.name as "merchant_name!: String", 
+               m.email as "merchant_email!: String"
+        FROM settlements s
+        JOIN payments p ON s.payment_id = p.id  
+        JOIN merchants m ON s.merchant_id = m.id
+        WHERE s.status IN ('pending_manual', 'ready_for_manual_processing')
+        ORDER BY s.estimated_processing_time ASC
+        LIMIT 100
+        "#
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    Ok(Json(settlements))
+}
+
+pub async fn mark_settlement_completed(
+    State(state): State<AppState>,
+    Path(settlement_id): Path<Uuid>,
+    Json(completion_data): Json<SettlementCompletionRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    sqlx::query!(
+        r#"
+        UPDATE settlements 
+        SET status = 'completed',
+            external_reference = $1,
+            completed_at = $2,
+            provider_response = $3
+        WHERE id = $4
+        "#,
+        completion_data.quidax_reference,
+        chrono::Utc::now(),
+        serde_json::json!({
+            "manual_completion": true,
+            "completed_by": completion_data.completed_by,
+            "quidax_reference": completion_data.quidax_reference,
+            "notes": completion_data.notes
+        }),
+        settlement_id
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Get payment ID for webhook
+    let payment_id = get_payment_id_from_settlement(&state, settlement_id).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let _ = crate::webhooks::create_webhook_event(
+        &state, 
+        payment_id, 
+        crate::webhooks::WebhookEventType::SettlementCompleted
+    ).await;
+
+    Ok(Json(serde_json::json!({
+        "message": "Settlement marked as completed",
+        "settlement_id": settlement_id,
+        "webhook_triggered": true
+    })))
 }
 
 async fn get_payment_id_from_settlement(
@@ -651,242 +756,29 @@ async fn get_payment_id_from_settlement(
     Ok(result.payment_id)
 }
 
-async fn process_usdc_wallet_transfer_with_retry(
-    state: &AppState,
-    settlement_id: Uuid,
-    usdc_amount: f64,
-    merchant_wallet: &str,
-    max_retries: u32,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut attempts = 0;
+pub async fn start_settlement_batch_worker(state: AppState) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1800)); 
     
-    while attempts < max_retries {
-        match process_usdc_wallet_transfer(state, settlement_id, usdc_amount, merchant_wallet).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                attempts += 1;
-                tracing::warn!("USDC transfer attempt {} failed: {}", attempts, e);
-                
-                if attempts >= max_retries {
-                    sqlx::query!(
-                        r#"
-                        UPDATE settlements 
-                        SET status = 'failed',
-                            provider_response = $1
-                        WHERE id = $2
-                        "#,
-                        serde_json::json!({
-                            "status": "failed",
-                            "error": e.to_string(),
-                            "attempts": attempts,
-                            "failure_reason": "max_retries_exceeded"
-                        }),
-                        settlement_id
-                    )
-                    .execute(&state.db)
-                    .await?;
-                    
-                    return Err(e);
-                }
+    loop {
+        interval.tick().await;
+        
+        tracing::info!("Running settlement batch worker...");
 
-                let delay_seconds = 2_u64.pow(attempts);
-                tokio::time::sleep(std::time::Duration::from_secs(delay_seconds)).await;
-            }
+        let updated_count = sqlx::query!(
+            r#"
+            UPDATE settlements 
+            SET status = 'ready_for_manual_processing'
+            WHERE status = 'pending_manual' 
+              AND estimated_processing_time <= NOW()
+            "#
+        )
+        .execute(&state.db)
+        .await
+        .map(|result| result.rows_affected())
+        .unwrap_or(0);
+        
+        if updated_count > 0 {
+            tracing::info!("Updated {} settlements to ready for manual processing", updated_count);
         }
-    }
-    
-    Ok(())
-}
-
-async fn check_escrow_balance(
-    state: &AppState,
-    required_usdc: f64,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let keypair_path = state.config.wallet_keypair_path
-        .as_ref()
-        .ok_or("Escrow wallet keypair path not configured")?;
-    
-    let keypair_bytes = fs::read(keypair_path)?;
-
-    if keypair_bytes.len() != 64 {
-        return Err("Invalid keypair file length".into());
-    }
-    
-    let mut keypair_array = [0u8; 64];
-    keypair_array.copy_from_slice(&keypair_bytes);
-    let escrow_keypair = Keypair::try_from(&keypair_array[..])?;
-    
-    let rpc_client = RpcClient::new(&state.solana_rpc_url);
-    let usdc_mint = Pubkey::from_str(&get_usdc_mint_for_network(&state.config.solana_network))?;
-    let escrow_ata = get_associated_token_address(&escrow_keypair.pubkey(), &usdc_mint);
-    
-    match rpc_client.get_token_account_balance(&escrow_ata) {
-        Ok(balance) => {
-            let current_balance = balance.ui_amount.unwrap_or(0.0);
-            let has_sufficient = current_balance >= required_usdc;
-            
-            tracing::info!(
-                "Escrow USDC balance: ${:.6}, Required: ${:.6}, Sufficient: {}",
-                current_balance, required_usdc, has_sufficient
-            );
-            
-            Ok(has_sufficient)
-        }
-        Err(e) => {
-            tracing::error!("Failed to check escrow balance: {}", e);
-            Err(e.into())
-        }
-    }
-}
-
-async fn execute_usdt_to_usdc_swap(
-    state: &AppState,
-    usdt_amount: f64,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let _swap_request = serde_json::json!({ 
-        "inputMint": crate::solana::DEVNET_USDT_MINT,
-        "outputMint": get_usdc_mint_for_network(&state.config.solana_network),
-        "amount": (usdt_amount * 1_000_000.0) as u64,
-        "slippageBps": 25,
-    });
-
-    // TODO: Real Jupiter API integration for USDT->USDC
-    let simulated_signature = format!("SWAP_USDT_USDC_{}", Uuid::new_v4());
-    
-    tracing::info!("Executed USDT->USDC swap: {} USDT -> {} USDC (signature: {})", 
-                   usdt_amount, usdt_amount, simulated_signature);
-    
-    Ok(simulated_signature)
-}
-
-#[allow(dead_code)]
-async fn get_payment_details(
-    state: &AppState,
-    payment_id: Uuid,
-) -> Result<Payment, Box<dyn std::error::Error + Send + Sync>> {
-    let payment = sqlx::query_as!(
-        Payment,
-        r#"SELECT id, merchant_id, amount_usd, amount_ngn, 
-                  status as "status: PaymentStatus", transaction_signature, 
-                  customer_wallet, metadata, created_at, expires_at 
-           FROM payments WHERE id = $1"#,
-        payment_id
-    )
-    .fetch_one(&state.db)
-    .await?;
-    
-    Ok(payment)
-}
-
-#[allow(dead_code)]
-async fn get_sol_usdc_rate() -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-    // Use Jupiter Price API or Serum for real-time SOL/USDC rate
-    let client = reqwest::Client::new();
-    let response: serde_json::Value = client
-        .get("https://price.jup.ag/v4/price?ids=SOL&vsToken=USDC")
-        .send()
-        .await?
-        .json()
-        .await?;
-    
-    if let Some(price) = response["data"]["SOL"]["price"].as_f64() {
-        Ok(price)
-    } else {
-        Err("Failed to get SOL/USDC rate".into())
-    }
-}
-
-async fn execute_sol_to_usdc_swap(
-    state: &AppState,
-    sol_amount: f64,
-    min_usdc_out: f64,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let _swap_request = serde_json::json!({
-        "inputMint": "So11111111111111111111111111111111111111112", 
-        "outputMint": get_usdc_mint_for_network(&state.config.solana_network),
-        "amount": (sol_amount * 1_000_000_000.0) as u64, 
-        "slippageBps": 50, // 0.5% slippage
-    });
-    
-    // This would integrate with Jupiter's swap API
-    // For now, simulate the swap
-    let simulated_signature = format!("SWAP_SOL_USDC_{}", Uuid::new_v4());
-    
-    tracing::info!("Executed SOL->USDC swap: {} SOL -> {} USDC (signature: {})", 
-                   sol_amount, min_usdc_out, simulated_signature);
-    
-    Ok(simulated_signature)
-}
-
-async fn calculate_settlement_amounts(
-    state: &AppState,
-    amount_usd: f64,
-    settlement_currency: &str,
-) -> Result<(f64, f64), Box<dyn std::error::Error + Send + Sync>> {
-    if settlement_currency == "NGN" {
-        let rate = crate::exchange::get_current_rate(state).await?;
-        let gross_ngn = amount_usd * rate.usd_to_ngn;
-
-        let transaction_fee_rate = 0.015; // 1.5%
-        let exchange_spread_rate = 0.005; // 0.5%
-        
-        let transaction_fee = gross_ngn * transaction_fee_rate;
-        let exchange_spread = gross_ngn * exchange_spread_rate;
-        let total_zendfi_fee = transaction_fee + exchange_spread;
-        
-        let merchant_receives = gross_ngn - total_zendfi_fee;
-        
-        tracing::info!(
-            "Settlement calculation - Gross: ₦{:.2}, ZendFi Fee: ₦{:.2} (2.0%), Merchant gets: ₦{:.2}",
-            gross_ngn, total_zendfi_fee, merchant_receives
-        );
-        
-        Ok((merchant_receives, total_zendfi_fee))
-    } else {
-        let transaction_fee = amount_usd * 0.015; 
-        let merchant_receives = amount_usd - transaction_fee;
-        Ok((merchant_receives, transaction_fee))
-    }
-}
-
-#[allow(dead_code)]
-pub async fn get_settlement_status(
-    state: &AppState,
-    payment_id: Uuid,
-) -> Result<Settlement, Box<dyn std::error::Error + Send + Sync>> {
-    let settlement = sqlx::query_as!(
-        Settlement,
-        r#"SELECT id, payment_id,
-                  COALESCE(payment_token, 'USDC') as "payment_token!: String",
-                  COALESCE(settlement_token, 'NGN') as "settlement_token!: String",
-                  COALESCE(amount_recieved, 0) as "amount_recieved!: BigDecimal",
-                  COALESCE(amount_settled, amount_ngn) as "amount_settled!: BigDecimal", 
-                  exchange_rate_used,
-                  sol_swap_signature,
-                  merchant_id, amount_ngn, bank_account, bank_code, 
-                  account_name, status, batch_id, estimated_processing_time,
-                  external_reference, provider, created_at, completed_at
-           FROM settlements WHERE payment_id = $1"#,
-        payment_id
-    )
-    .fetch_one(&state.db)
-    .await?;
-    
-    Ok(settlement)
-}
-
-#[cfg(test)]
-mod tests {
-    
-    #[tokio::test]
-    async fn test_settlement_calculation() {
-        let amount_usd = 100.0;
-        let expected_ngn = amount_usd * 1650.0;
-        let expected_fee = expected_ngn * 0.02;
-        let expected_merchant = expected_ngn - expected_fee;
-        
-        assert!(expected_merchant > 0.0);
-        assert!(expected_fee > 0.0);
-        assert_eq!(expected_fee, 3300.0); 
     }
 }

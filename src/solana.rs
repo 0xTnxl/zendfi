@@ -61,9 +61,9 @@ pub async fn generate_payment_qr(
     let solana_pay_url = match token {
         SupportedToken::Sol => {
             // Native SOL transfer
-            let amount_lamports = (amount_usd * 1_000_000_000.0) as u64; // SOL has 9 decimals
+            let amount_lamports = (amount_usd * 1_000_000_000.0) as u64;
             format!(
-                "solana:{}?amount={}&reference={}&label=ZendFi%20Payment%20(SOL)&message=Payment%20{}",
+                "solana:{}?amount={}&reference={}&label=Solapay%20Payment%20(SOL)&message=Payment%20{}",
                 recipient, amount_lamports, payment_id, payment_id
             )
         }
@@ -74,7 +74,7 @@ pub async fn generate_payment_qr(
                 .ok_or("Unsupported token for network")?;
             
             format!(
-                "solana:{}?amount={}&spl-token={}&reference={}&label=ZendFi%20Payment%20({:?})&message=Payment%20{}",
+                "solana:{}?amount={}&spl-token={}&reference={}&label=Solapay%20Payment%20({:?})&message=Payment%20{}",
                 recipient, amount_tokens, mint_address, payment_id, token, payment_id
             )
         }

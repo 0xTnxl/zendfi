@@ -154,7 +154,7 @@ pub async fn get_payment(
         Payment,
         r#"SELECT id, merchant_id, amount_usd, amount_ngn, 
                   status as "status: PaymentStatus", transaction_signature, 
-                  customer_wallet, metadata, created_at, expires_at 
+                  customer_wallet, metadata, created_at, expires_at
            FROM payments WHERE id = $1"#,
         id
     )
@@ -240,7 +240,7 @@ pub async fn create_merchant(
         r#"
         INSERT INTO merchants 
         (id, name, email, wallet_address, settlement_preference, wallet_generated,
-         bank_account_number, bank_code, account_name, business_address, 
+         bank_account_number, bank_code, account_name, business_address,
          webhook_url, created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
         RETURNING id, name, email, wallet_address
@@ -274,7 +274,6 @@ pub async fn create_merchant(
             "name": merchant.name,
             "email": merchant.email,
             "wallet_address": merchant.wallet_address,
-            "settlement_preference": settlement_pref,
             "wallet_generated": wallet_generated
         },
         "api_key": api_key,
@@ -340,10 +339,10 @@ async fn generate_merchant_wallet(
 }
 
 fn encrypt_keypair_data(data: &str, merchant_id: &Uuid) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let master_key = std::env::var("ZENDFI_MASTER_KEY")
-        .unwrap_or_else(|_| "zendfi_default_key_change_in_production".to_string());
+    let master_key = std::env::var("SOLAPAY_MASTER_KEY")
+        .unwrap_or_else(|_| "solapay_default_key_change_in_production".to_string());
     
-    let salt = format!("zendfi_salt_{}", merchant_id);
+    let salt = format!("solapay_salt_{}", merchant_id);
     let argon2 = Argon2::default();
 
     let mut derived_key = [0u8; 32];
@@ -371,10 +370,10 @@ fn encrypt_keypair_data(data: &str, merchant_id: &Uuid) -> Result<String, Box<dy
 }
 
 fn decrypt_keypair_data(encrypted: &str, merchant_id: &Uuid) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let master_key = std::env::var("ZENDFI_MASTER_KEY")
-        .unwrap_or_else(|_| "zendfi_default_key_change_in_production".to_string());
+    let master_key = std::env::var("SOLAPAY_MASTER_KEY")
+        .unwrap_or_else(|_| "solapay_default_key_change_in_production".to_string());
     
-    let salt = format!("zendfi_salt_{}", merchant_id);
+    let salt = format!("solapay_salt_{}", merchant_id);
     let argon2 = Argon2::default();
     
     let mut derived_key = [0u8; 32];
@@ -461,7 +460,7 @@ async fn is_valid_webhook_url(url: &str) -> bool {
 async fn perform_production_webhook_check(url: &str) -> bool {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
-        .user_agent("ZendFi-Webhook-Validator/1.0")
+        .user_agent("Solapay-Webhook-Validator/1.0")
         .build()
         .unwrap();
 
@@ -549,9 +548,9 @@ pub async fn get_settlement_status(
     State(state): State<AppState>,
     Path(payment_id): Path<Uuid>,
     Extension(merchant): Extension<AuthenticatedMerchant>,
-) -> Result<Json<crate::settlements::Settlement>, StatusCode> {
+) -> Result<Json<crate::models::Settlement>, StatusCode> {
     let settlement = sqlx::query_as!(
-        crate::settlements::Settlement,
+        crate::models::Settlement,
         r#"SELECT id, payment_id, 
                   COALESCE(payment_token, 'USDC') as "payment_token!: String",
                   COALESCE(settlement_token, 'NGN') as "settlement_token!: String", 
@@ -579,9 +578,9 @@ pub async fn get_settlement_status(
 pub async fn list_settlements(
     State(state): State<AppState>,
     Extension(merchant): Extension<AuthenticatedMerchant>,
-) -> Result<Json<Vec<crate::settlements::Settlement>>, StatusCode> {
+) -> Result<Json<Vec<crate::models::Settlement>>, StatusCode> {
     let settlements = sqlx::query_as!(
-        crate::settlements::Settlement,
+        crate::models::Settlement,
         r#"SELECT id, payment_id,
                   COALESCE(payment_token, 'USDC') as "payment_token!: String",
                   COALESCE(settlement_token, 'NGN') as "settlement_token!: String",
@@ -770,7 +769,7 @@ pub async fn reset_database(
 pub async fn health_check() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "healthy",
-        "service": "ZendFi Payment Gateway",
+        "service": "Solapay Payment Gateway",
         "timestamp": chrono::Utc::now(),
         "version": "0.1.0"
     }))

@@ -5904,6 +5904,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "solapay"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "axum",
+ "base64 0.22.1",
+ "bigdecimal",
+ "bs58 0.4.0",
+ "chrono",
+ "dotenvy",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "hmac 0.12.1",
+ "once_cell",
+ "rand 0.8.5",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "solana-client",
+ "solana-sdk",
+ "spl-associated-token-account",
+ "spl-memo 6.0.0",
+ "spl-token",
+ "sqlx",
+ "subtle",
+ "tokio",
+ "tower 0.4.13",
+ "tower-http 0.4.4",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6002,6 +6040,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "spl-memo"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f09647c0974e33366efeb83b8e2daebb329f0420149e74d3a4bd2c08cf9f7cb"
+dependencies = [
+ "solana-account-info",
+ "solana-instruction",
+ "solana-msg",
+ "solana-program-entrypoint",
+ "solana-program-error",
+ "solana-pubkey",
+]
+
+[[package]]
 name = "spl-pod"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6083,7 +6135,7 @@ dependencies = [
  "solana-program",
  "solana-security-txt",
  "solana-zk-token-sdk",
- "spl-memo",
+ "spl-memo 5.0.0",
  "spl-pod",
  "spl-token",
  "spl-token-group-interface",
@@ -7705,42 +7757,6 @@ dependencies = [
  "quote",
  "syn 2.0.106",
  "synstructure 0.13.2",
-]
-
-[[package]]
-name = "zendfi"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "argon2",
- "axum",
- "base64 0.22.1",
- "bigdecimal",
- "bs58 0.4.0",
- "chrono",
- "dotenvy",
- "ed25519-dalek 2.2.0",
- "hex",
- "hmac 0.12.1",
- "rand 0.8.5",
- "reqwest 0.11.27",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "solana-client",
- "solana-sdk",
- "spl-associated-token-account",
- "spl-token",
- "sqlx",
- "subtle",
- "tokio",
- "tower 0.4.13",
- "tower-http 0.4.4",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "zeroize",
 ]
 
 [[package]]
