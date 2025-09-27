@@ -303,17 +303,31 @@ async fn execute_crypto_transfer(
     token: &str,
     recipient_wallet: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!("Executing {} transfer: ${} to {}", token, amount, recipient_wallet);
+    
     let keypair_path = state.config.wallet_keypair_path
         .as_ref()
-        .ok_or("Escrow wallet keypair path not configured")?;
+        .ok_or("Escrow wallet keypair path not configured - check WALLET_KEYPAIR_PATH")?;
+
+    if !std::path::Path::new(keypair_path).exists() {
+        return Err(format!("Keypair file does not exist: {}", keypair_path).into());
+    }
     
-    let keypair_bytes = fs::read(keypair_path)?;
+    let keypair_bytes = fs::read(keypair_path)
+        .map_err(|e| format!("Failed to read keypair file {}: {}", keypair_path, e))?;
+        
+    if keypair_bytes.len() != 64 {
+        return Err(format!("Invalid keypair file size: expected 64 bytes, got {}", keypair_bytes.len()).into());
+    }
+
     let mut keypair_array = [0u8; 64];
     keypair_array.copy_from_slice(&keypair_bytes);
-    let escrow_keypair = solana_sdk::signature::keypair::Keypair::try_from(&keypair_array[..])?;
+    let escrow_keypair = solana_sdk::signature::keypair::Keypair::try_from(&keypair_array[..])
+        .map_err(|e| format!("Failed to parse keypair: {}", e))?;
 
     let rpc_client = RpcClient::new(&state.solana_rpc_url);
-    let recipient_pubkey = Pubkey::from_str(recipient_wallet)?;
+    let recipient_pubkey = Pubkey::from_str(recipient_wallet)
+        .map_err(|e| format!("Invalid recipient wallet address: {}", e))?;
 
     let signature = match token {
         "SOL" => {
@@ -324,7 +338,9 @@ async fn execute_crypto_transfer(
                 lamports,
             );
             
-            let recent_blockhash = rpc_client.get_latest_blockhash()?;
+            let recent_blockhash = rpc_client.get_latest_blockhash()
+                .map_err(|e| format!("Failed to get blockhash: {}", e))?;
+
             let transaction = Transaction::new_signed_with_payer(
                 &[transfer_ix],
                 Some(&escrow_keypair.pubkey()),
@@ -332,11 +348,13 @@ async fn execute_crypto_transfer(
                 recent_blockhash,
             );
             
-            rpc_client.send_and_confirm_transaction(&transaction)?
+            rpc_client.send_and_confirm_transaction(&transaction)
+                .map_err(|e| format!("SOL transfer failed: {}", e))?
         }
         "USDC" | "USDT" => {
             let mint_address = get_token_mint_address(token)?;
-            let token_mint = Pubkey::from_str(mint_address)?;
+            let token_mint = Pubkey::from_str(mint_address)
+                .map_err(|e| format!("Invalid token mint address: {}", e))?;
             let amount_tokens = (amount * get_token_decimals_multiplier(token)?) as u64;
             
             let escrow_ata = get_associated_token_address(&escrow_keypair.pubkey(), &token_mint);
@@ -344,7 +362,9 @@ async fn execute_crypto_transfer(
             
             let mut instructions = Vec::new();
 
+            // Check if the recipient ATA exists
             if rpc_client.get_account(&recipient_ata).is_err() {
+                tracing::info!("Creating ATA for recipient: {}", recipient_ata);
                 let create_ata_ix = ata_instruction::create_associated_token_account(
                     &escrow_keypair.pubkey(),
                     &recipient_pubkey,
@@ -361,14 +381,16 @@ async fn execute_crypto_transfer(
                 &escrow_keypair.pubkey(),
                 &[&escrow_keypair.pubkey()],
                 amount_tokens,
-            )?;
+            ).map_err(|e| format!("Failed to create transfer instruction: {}", e))?;
             instructions.push(transfer_ix);
 
             let memo_data = format!("Solapay settlement: {}", settlement_id);
             let memo_ix = create_memo_instruction(&memo_data);
             instructions.push(memo_ix);
 
-            let recent_blockhash = rpc_client.get_latest_blockhash()?;
+            let recent_blockhash = rpc_client.get_latest_blockhash()
+                .map_err(|e| format!("Failed to get blockhash: {}", e))?;
+
             let transaction = Transaction::new_signed_with_payer(
                 &instructions,
                 Some(&escrow_keypair.pubkey()),
@@ -376,7 +398,8 @@ async fn execute_crypto_transfer(
                 recent_blockhash,
             );
 
-            rpc_client.send_and_confirm_transaction(&transaction)?
+            rpc_client.send_and_confirm_transaction(&transaction)
+                .map_err(|e| format!("{} transfer failed: {}", token, e))?
         }
         _ => return Err(format!("Unsupported token: {}", token).into())
     };
@@ -390,7 +413,8 @@ async fn execute_crypto_transfer(
         settlement_id
     )
     .execute(&state.db)
-    .await?;
+    .await
+    .map_err(|e| format!("Failed to update settlement status: {}", e))?;
 
     tracing::info!("{} transfer completed! Signature: {}", token, signature);
     Ok(())

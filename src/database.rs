@@ -2,8 +2,8 @@ use sqlx::PgPool;
 
 pub async fn initialize_database(database_url: &str) -> Result<PgPool, sqlx::Error> {
     let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(50)  // Increased for production
-        .min_connections(5)   // Maintain minimum connections
+        .max_connections(50)  
+        .min_connections(5)  
         .acquire_timeout(std::time::Duration::from_secs(30))
         .idle_timeout(std::time::Duration::from_secs(300))
         .max_lifetime(std::time::Duration::from_secs(3600))

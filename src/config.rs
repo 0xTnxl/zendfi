@@ -1,3 +1,29 @@
+use std::str::FromStr;
+use solana_sdk::pubkey::Pubkey;
+
+#[derive(Debug)]
+pub enum ConfigError {
+    MissingSeed,
+    InvalidSeedLength,
+    InvalidRecipientWallet,
+    MissingRequiredEnvVar(String),
+    InvalidUrl(String),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            ConfigError::MissingSeed => write!(f, "SOLAPAY_MASTER_SEED is required"),
+            ConfigError::InvalidSeedLength => write!(f, "SOLAPAY_MASTER_SEED must be at least 32 characters"),
+            ConfigError::InvalidRecipientWallet => write!(f, "RECIPIENT_WALLET is not a valid Solana address"),
+            ConfigError::MissingRequiredEnvVar(var) => write!(f, "Required environment variable {} is missing", var),
+            ConfigError::InvalidUrl(url) => write!(f, "Invalid URL: {}", url),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database_url: String,
@@ -12,8 +38,17 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, ConfigError> {
         dotenvy::dotenv().ok();
+
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| ConfigError::MissingRequiredEnvVar("DATABASE_URL".to_string()))?;
+        
+        let recipient_wallet = std::env::var("RECIPIENT_WALLET")
+            .map_err(|_| ConfigError::MissingRequiredEnvVar("RECIPIENT_WALLET".to_string()))?;
+
+        Pubkey::from_str(&recipient_wallet)
+            .map_err(|_| ConfigError::InvalidRecipientWallet)?;
         
         let solana_rpc_urls = if let Ok(urls) = std::env::var("SOLANA_RPC_URLS") {
             urls.split(',')
@@ -38,23 +73,47 @@ impl Config {
                 }
             });
         
-        Self {
-            database_url: std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgresql://localhost/zendfi".to_string()),
+        let config = Self {
+            database_url,
             solana_rpc_urls,
-            recipient_wallet: std::env::var("RECIPIENT_WALLET")
-                .expect("RECIPIENT_WALLET must be set"),
+            recipient_wallet,
             wallet_keypair_path: std::env::var("WALLET_KEYPAIR_PATH").ok(),
             frontend_url: std::env::var("FRONTEND_URL")
                 .unwrap_or_else(|_| "http://localhost:3001".to_string()),
             port: std::env::var("PORT")
                 .unwrap_or_else(|_| "3000".to_string())
                 .parse()
-                .expect("PORT must be a valid number"),
+                .map_err(|_| ConfigError::MissingRequiredEnvVar("PORT must be valid number".to_string()))?,
             usdc_mint,    
             solana_network, 
             merchant_wallet_dir: std::env::var("MERCHANT_WALLET_DIR")
                 .unwrap_or_else(|_| "./secure/merchant_wallets".to_string()),
+        };
+
+        config.validate()?;
+        
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for url in &self.solana_rpc_urls {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ConfigError::InvalidUrl(url.clone()));
+            }
         }
+
+        if self.recipient_wallet == "11111111111111111111111111111112" {
+            return Err(ConfigError::InvalidRecipientWallet);
+        }
+
+        if let Ok(master_seed) = std::env::var("SOLAPAY_MASTER_SEED") {
+            if master_seed.len() < 32 {
+                return Err(ConfigError::InvalidSeedLength);
+            }
+        } else {
+            tracing::warn!("SOLAPAY_MASTER_SEED not set - merchant wallet generation will fail");
+        }
+        
+        Ok(())
     }
 }

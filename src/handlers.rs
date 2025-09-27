@@ -15,21 +15,66 @@ use sha2::Sha256;
 use bigdecimal::ToPrimitive;
 use bip39::{Mnemonic, Language};
 use ed25519_dalek::Signer;
+use tracing::instrument;
 
+fn validate_payment_amount(amount: f64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if amount <= 0.0 {
+        return Err("Payment amount must be positive".into());
+    }
+    if amount > 1_000_000.0 {
+        return Err("Payment amount exceeds maximum limit".into());
+    }
+    if amount < 0.01 {
+        return Err("Payment amount below minimum ($0.01)".into());
+    }
+    Ok(())
+}
+
+fn validate_merchant_data(request: &CreateMerchantRequest) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if request.name.trim().is_empty() {
+        return Err("Merchant name cannot be empty".into());
+    }
+    if request.name.len() > 100 {
+        return Err("Merchant name too long (max 100 characters)".into());
+    }
+    if !request.email.contains('@') {
+        return Err("Invalid email format".into());
+    }
+    if request.business_address.trim().is_empty() {
+        return Err("Business address is required".into());
+    }
+    Ok(())
+}
+
+#[instrument(skip(state), fields(merchant_id = %merchant.merchant_id))]
 pub async fn create_payment(
     State(state): State<AppState>,
     Extension(merchant): Extension<AuthenticatedMerchant>,
     Json(request): Json<CreatePaymentRequest>,
 ) -> Result<Json<PaymentResponse>, StatusCode> {
+    tracing::info!("Creating payment for ${} {}", request.amount, request.currency);
+
+    validate_payment_amount(request.amount)
+        .map_err(|e| {
+            tracing::warn!("Invalid payment amount: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+    
     if request.amount <= 0.0 || request.amount > 1_000_000.0 {
         return Err(StatusCode::BAD_REQUEST);
     }
 
     if request.currency != "USD" {
+        tracing::warn!("Unsupported currency: {}", request.currency);
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    if !check_merchant_limits(&state, merchant.merchant_id, request.amount).await? {
+    if !check_merchant_limits(&state, merchant.merchant_id, request.amount).await
+        .map_err(|e| {
+            tracing::error!("Error checking merchant limits: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    {
         tracing::warn!("Merchant {} exceeded payment limits", merchant.merchant_id);
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
@@ -41,10 +86,9 @@ pub async fn create_payment(
     };
 
     if token.get_mint_address(&state.config.solana_network).is_none() && !matches!(token, crate::solana::SupportedToken::Sol) {
+        tracing::warn!("Unsupported token for network: {:?} on {}", token, state.config.solana_network);
         return Err(StatusCode::BAD_REQUEST);
     }
-
-
 
     let amount_usd = request.amount;
     let payment_id = Uuid::new_v4();
@@ -63,7 +107,11 @@ pub async fn create_payment(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let mut tx = state.db.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut tx = state.db.begin().await
+        .map_err(|e| {
+            tracing::error!("Failed to begin transaction: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     
     sqlx::query!(
         r#"
@@ -88,7 +136,7 @@ pub async fn create_payment(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Audit log
+    // Audit log with correlation ID
     sqlx::query!(
         r#"
         INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by)
@@ -104,14 +152,24 @@ pub async fn create_payment(
     )
     .execute(&mut *tx)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|e| {
+        tracing::error!("Failed to insert audit log: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tx.commit().await
+        .map_err(|e| {
+            tracing::error!("Failed to commit transaction: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-    // Create webhook event
+    // Create webhook event (non-blocking)
     if let Err(e) = crate::webhooks::create_webhook_event(&state, payment_id, crate::webhooks::WebhookEventType::PaymentCreated).await {
         tracing::error!("Failed to create webhook event: {}", e);
+        // Don't fail the payment creation for webhook errors
     }
+
+    tracing::info!("Payment {} created successfully", payment_id);
     
     Ok(Json(PaymentResponse {
         id: payment_id,
@@ -262,13 +320,23 @@ pub async fn get_payment_status(
     })))
 }
 
+#[instrument(skip(state))]
 pub async fn create_merchant(
     State(state): State<AppState>,
     Json(request): Json<CreateMerchantRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    tracing::info!("Creating merchant: {}", request.name);
+
+    validate_merchant_data(&request)
+        .map_err(|e| {
+            tracing::warn!("Invalid merchant data: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+
     if let Some(ref webhook_url) = request.webhook_url {
         if !is_valid_webhook_url(webhook_url).await {
             tracing::warn!("Invalid webhook URL provided: {}", webhook_url);
+            return Err(StatusCode::BAD_REQUEST);
         }
     }
 
@@ -276,7 +344,10 @@ pub async fn create_merchant(
 
     let (merchant_wallet, wallet_generated, generation_method) = if let Some(provided_wallet) = request.wallet_address {
         crate::solana::validate_solana_address(&provided_wallet)
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+            .map_err(|e| {
+                tracing::warn!("Invalid wallet address: {}", e);
+                StatusCode::BAD_REQUEST
+            })?;
         (provided_wallet, false, "provided".to_string())
     } else {
         let method = request.wallet_generation_method
@@ -293,7 +364,6 @@ pub async fn create_merchant(
                 (wallet_pubkey, true, "mnemonic".to_string())
             }
             _ => {
-                // Default to simple generation
                 let wallet_pubkey = generate_simple_merchant_wallet(&merchant_id, &state).await
                     .map_err(|e| {
                         tracing::error!("Failed to generate simple wallet: {}", e);
@@ -335,8 +405,13 @@ pub async fn create_merchant(
     })?;
 
     let api_key = crate::auth::generate_api_key_string(&state, merchant_id).await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!("Failed to generate API key: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     
+    tracing::info!("Merchant {} created successfully with wallet {}", merchant_id, merchant_wallet);
+
     Ok(Json(serde_json::json!({
         "merchant": {
             "id": merchant_id,
@@ -367,7 +442,11 @@ async fn generate_simple_merchant_wallet(
     state: &AppState,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let master_secret = std::env::var("SOLAPAY_MASTER_SEED")
-        .unwrap_or_else(|_| "default-insecure-seed-change-this".to_string());
+        .map_err(|_| "SOLAPAY_MASTER_SEED environment variable is required for security")?;
+    
+    if master_secret.len() < 32 {
+        return Err("SOLAPAY_MASTER_SEED must be at least 32 characters".into());
+    }
     
     let mut mac = Hmac::<Sha256>::new_from_slice(master_secret.as_bytes())?;
     mac.update(merchant_id.as_bytes());
@@ -454,7 +533,6 @@ async fn store_wallet_metadata(
 }
 
 #[allow(dead_code)]
-// This function is not useless, it's intended for future development of merchant-controlled settlements
 pub async fn sign_settlement_transaction(
     state: &AppState,
     merchant_id: Uuid,
@@ -469,7 +547,11 @@ pub async fn sign_settlement_transaction(
 
     let signature = if wallet_info.derivation_path == "simple" {
         let master_secret = std::env::var("SOLAPAY_MASTER_SEED")
-            .unwrap_or_else(|_| "default-insecure-seed-change-this".to_string());
+            .map_err(|_| "SOLAPAY_MASTER_SEED environment variable is required for security")?;
+        
+        if master_secret.len() < 32 {
+            return Err("SOLAPAY_MASTER_SEED must be at least 32 characters".into());
+        }
         
         let mut mac = Hmac::<Sha256>::new_from_slice(master_secret.as_bytes())?;
         mac.update(merchant_id.as_bytes());
@@ -480,8 +562,10 @@ pub async fn sign_settlement_transaction(
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed_bytes);
         signing_key.sign(transaction_data)
     } else if wallet_info.derivation_path == "mnemonic-derived" {
-        let mnemonic_phrase = std::env::var("SOLAPAY_MASTER_MNEMONIC")?;
-        let mnemonic = Mnemonic::parse_in_normalized(Language::English, &mnemonic_phrase)?;
+        let mnemonic_phrase = std::env::var("SOLAPAY_MASTER_MNEMONIC")
+            .map_err(|_| "SOLAPAY_MASTER_MNEMONIC environment variable is required")?;
+        let mnemonic = Mnemonic::parse_in_normalized(Language::English, &mnemonic_phrase)
+            .map_err(|e| format!("Invalid mnemonic phrase: {}", e))?;
         let passphrase = format!("merchant_{}", merchant_id);
         let seed = mnemonic.to_seed(&passphrase);
         
@@ -655,20 +739,57 @@ pub async fn system_health(State(state): State<AppState>) -> Json<serde_json::Va
     let db_healthy = check_database_health(&state.db).await;
     let solana_stats = state.solana_client.get_endpoint_stats().await;
     let solana_healthy = solana_stats.iter().any(|(_, health)| health.consecutive_failures < 3);
+
+    let config_issues = check_security_config().await;
+    let security_healthy = config_issues.is_empty();
     
     let system_metrics = get_system_metrics(&state.db).await;
     
+    let overall_status = if db_healthy && solana_healthy && security_healthy {
+        "healthy"
+    } else if db_healthy && solana_healthy {
+        "warning"
+    } else {
+        "unhealthy"
+    };
+    
     Json(serde_json::json!({
-        "status": if db_healthy && solana_healthy { "healthy" } else { "degraded" },
+        "status": overall_status,
         "services": {
             "database": if db_healthy { "up" } else { "down" },
             "solana_rpc": if solana_healthy { "up" } else { "degraded" },
+            "security": if security_healthy { "ok" } else { "warning" },
             "jupiter_dex": "up"
         },
+        "security_warnings": config_issues,
         "metrics": system_metrics,
         "timestamp": chrono::Utc::now(),
-        "version": "0.2.0 - Direct Crypto Only"
+        "version": "0.3.0 - Security Improved"
     }))
+}
+
+async fn check_security_config() -> Vec<String> {
+    let mut warnings = Vec::new();
+    
+    // Check if master seed is set
+    if std::env::var("SOLAPAY_MASTER_SEED").is_err() {
+        warnings.push("SOLAPAY_MASTER_SEED not configured - merchant wallets cannot be generated".to_string());
+    } else if let Ok(seed) = std::env::var("SOLAPAY_MASTER_SEED") {
+        if seed.len() < 32 {
+            warnings.push("SOLAPAY_MASTER_SEED is too short (minimum 32 characters)".to_string());
+        }
+    }
+    
+    // Check if running in development with weak settings
+    if let Ok(env) = std::env::var("ENVIRONMENT") {
+        if env == "production" {
+            if std::env::var("RUST_LOG").unwrap_or_default().contains("debug") {
+                warnings.push("Debug logging enabled in production".to_string());
+            }
+        }
+    }
+    
+    warnings
 }
 
 async fn get_system_metrics(db: &sqlx::PgPool) -> serde_json::Value {

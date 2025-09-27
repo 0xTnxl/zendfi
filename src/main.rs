@@ -7,6 +7,8 @@ use axum::{
     extract::Request,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use uuid::Uuid;
+use tracing::Instrument;
 
 mod auth;
 mod models;
@@ -22,7 +24,6 @@ use handlers::*;
 use config::Config;
 use std::sync::Arc;
 
-
 #[derive(Clone)]
 pub struct AppState {
     pub db: sqlx::PgPool,
@@ -31,21 +32,52 @@ pub struct AppState {
     pub config: Config,
 }
 
+async fn correlation_id_middleware(mut request: Request, next: Next) -> Result<Response, StatusCode> {
+    let correlation_id = Uuid::new_v4().to_string();
+    request.headers_mut().insert(
+        "x-correlation-id",
+        correlation_id.parse().unwrap()
+    );
+
+    let span = tracing::info_span!(
+        "request",
+        correlation_id = &correlation_id,
+        method = %request.method(),
+        path = %request.uri().path()
+    );
+
+    let response = next.run(request).instrument(span).await;
+    Ok(response)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "solapay=debug,tower_http=debug".into()),
+                .unwrap_or_else(|_| "zendfi=info,sqlx=warn,tower_http=info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("Starting Solapay Payment Gateway");
+    tracing::info!("Starting Solpay Payment Gateway");
     
-    let config = Config::from_env();
+    let config = match Config::from_env() {
+        Ok(config) => {
+            tracing::info!("Configuration loaded successfully");
+            config
+        },
+        Err(e) => {
+            tracing::error!("Configuration error: {}", e);
+            std::process::exit(1);
+        }
+    };
 
-    let db = database::initialize_database(&config.database_url).await?;
+    let db = database::initialize_database(&config.database_url).await
+        .map_err(|e| {
+            tracing::error!("Database initialization failed: {}", e);
+            e
+        })?;
     
     let solana_client = Arc::new(sol_client::ResilientSolanaClient::new(
         config.solana_rpc_urls.clone()
@@ -63,11 +95,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
     };
 
-
-
     match test_solana_connection(&state.solana_rpc_url).await {
-        Ok(_) => tracing::info!("Connected to Solana RPC"),
-        Err(e) => tracing::warn!("Solana RPC connection issue: {}", e),
+        Ok(_) => tracing::info!("Solana RPC connection verified"),
+        Err(e) => {
+            tracing::error!("Solana RPC connection failed: {}", e);
+            // Don't exit, we'll let it try to recover
+        }
     }
 
     let webhook_state = state.clone();
@@ -99,15 +132,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .merge(public_routes)
         .merge(protected_routes)
+        .layer(middleware::from_fn(correlation_id_middleware))
         .layer(middleware::from_fn(cors_layer));
     
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port))
         .await?;
         
     tracing::info!("Solapay API running on http://0.0.0.0:{}", config.port);
+    tracing::info!("Health endpoint: http://0.0.0.0:{}/system/health", config.port);
     tracing::info!("API Documentation: http://0.0.0.0:{}/", config.port);
     
-    axum::serve(listener, app).await?;
+    // And yes! A graceful shutdown
+    let shutdown = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install CTRL+C signal handler");
+        tracing::info!("Recieved shutdown signal, gracefully shutting down...");
+    };
+    
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
     
     Ok(())
 }
