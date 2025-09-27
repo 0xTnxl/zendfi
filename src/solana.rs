@@ -38,6 +38,7 @@ impl SupportedToken {
     } 
 }
 
+#[allow(dead_code)]
 pub fn get_usdc_mint_for_network(network: &str) -> &'static str {
     match network.to_lowercase().as_str() {
         "mainnet" | "mainnet-beta" => MAINNET_USDC_MINT,

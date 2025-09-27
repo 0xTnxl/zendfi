@@ -5,8 +5,8 @@ use axum::{
     response::Response,
 };
 use uuid::Uuid;
-use sha2::Digest;
-
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::password_hash::{rand_core::OsRng, SaltString};
 use crate::AppState;
 
 #[derive(Debug, Clone)]
@@ -37,24 +37,33 @@ pub async fn authenticate_merchant(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // Hash the API key for lookup
-    let key_hash = sha2::Sha256::digest(api_key.as_bytes());
-    let key_hash_hex = hex::encode(key_hash);
-
-    let api_key_record = sqlx::query!(
+    let key_prefix = api_key.chars().take(12).collect::<String>();
+    let api_key_records = sqlx::query!(
         r#"
         SELECT id, merchant_id, key_hash, is_active, last_used_at, created_at
         FROM api_keys 
-        WHERE key_hash = $1 AND is_active = true
+        WHERE key_prefix = $1 AND is_active = true
         "#,
-        key_hash_hex
+        key_prefix
     )
-    .fetch_optional(&state.db)
+    .fetch_all(&state.db)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::UNAUTHORIZED)?;
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Update last used timestamp
+    let argon2 = Argon2::default();
+    let mut authenticated_record = None;
+
+    for record in api_key_records {
+        if let Ok(parsed_hash) = PasswordHash::new(&record.key_hash) {
+            if argon2.verify_password(api_key.as_bytes(), &parsed_hash).is_ok() {
+                authenticated_record = Some(record);
+                break;
+            }
+        }
+    }
+
+    let api_key_record = authenticated_record.ok_or(StatusCode::UNAUTHORIZED)?;
+
     let _ = sqlx::query!(
         "UPDATE api_keys SET last_used_at = NOW() WHERE id = $1",
         api_key_record.id
@@ -62,7 +71,6 @@ pub async fn authenticate_merchant(
     .execute(&state.db)
     .await;
 
-    // Add merchant info to request extensions
     let authenticated_merchant = AuthenticatedMerchant {
         merchant_id: api_key_record.merchant_id,
         api_key_id: api_key_record.id,
@@ -79,9 +87,11 @@ pub async fn generate_api_key_string(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let key_bytes: [u8; 32] = rand::random();
     let api_key = format!("zfi_live_{}", hex::encode(key_bytes));
-    
-    let key_hash = sha2::Sha256::digest(api_key.as_bytes());
-    let key_hash_hex = hex::encode(key_hash);
+
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+    let key_hash = argon2.hash_password(api_key.as_bytes(), &salt)
+        .map_err(|e| format!("Password hashing failed: {}", e))?; 
     
     let key_prefix = api_key.chars().take(12).collect::<String>();
     
@@ -92,7 +102,7 @@ pub async fn generate_api_key_string(
         "#,
         Uuid::new_v4(),
         merchant_id,
-        key_hash_hex,
+        key_hash.to_string(),
         key_prefix,
         true,
         chrono::Utc::now()

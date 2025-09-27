@@ -21,7 +21,6 @@ pub struct Payment {
     pub id: Uuid,
     pub merchant_id: Uuid,
     pub amount_usd: BigDecimal,
-    pub amount_ngn: Option<BigDecimal>,
     pub status: PaymentStatus,
     pub transaction_signature: Option<String>,
     pub customer_wallet: Option<String>,
@@ -47,8 +46,7 @@ pub struct CreatePaymentRequest {
     pub description: Option<String>,
     pub metadata: Option<serde_json::Value>,
     pub webhook_url: Option<String>,
-    pub settlement_currency: Option<String>,
-    pub sol_settlement_preference: Option<String>, 
+    pub settlement_preference_override: Option<String>, 
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,29 +55,23 @@ pub struct CreateMerchantRequest {
     pub email: String,
     pub settlement_preference: Option<String>, 
     pub wallet_address: Option<String>, 
-    pub bank_account_number: Option<String>,
-    pub bank_code: Option<String>, 
-    pub account_name: Option<String>,
     pub business_address: String,
-    pub settlement_currency: Option<String>,
-    
     pub webhook_url: Option<String>,
+    pub wallet_generation_method: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum SettlementPreference {
-    AutoNgn,      // Always settle to NGN bank account
-    AutoUsdc,     // Always settle to USDC wallet  
-    PerPayment,   // Merchant chooses per payment
+    AutoUsdc, 
+    DirectToken,
 }
 
 impl From<&str> for SettlementPreference {
     fn from(s: &str) -> Self {
         match s.to_lowercase().as_str() {
-            "auto_usdc" => SettlementPreference::AutoUsdc,
-            "per_payment" => SettlementPreference::PerPayment,
-            _ => SettlementPreference::AutoNgn,
+            "direct_token" => SettlementPreference::DirectToken,
+            _ => SettlementPreference::AutoUsdc,
         }
     }
 }
@@ -110,27 +102,10 @@ pub struct ExchangeRate {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ManualSettlementItem {
-    pub id: Uuid,
-    pub payment_id: Uuid,
-    pub amount_ngn: BigDecimal,
-    pub bank_account: String,
-    pub bank_code: String,
-    pub account_name: String,
-    pub status: String,
-    pub created_at: DateTime<Utc>,
-    pub estimated_processing_time: Option<DateTime<Utc>>,
-    pub amount_usd: BigDecimal,
-    pub payment_token: Option<String>,
-    pub merchant_name: String,
-    pub merchant_email: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct MerchantDashboard {
     pub merchant_id: Uuid,
     pub total_volume_usd: f64,
-    pub total_volume_ngn: f64,
+    pub total_volume_ngn: f64, 
     pub total_transactions: i64,
     pub successful_transactions: i64,
     pub pending_transactions: i64,
@@ -159,15 +134,12 @@ pub struct Settlement {
     pub exchange_rate_used: Option<BigDecimal>,
     pub sol_swap_signature: Option<String>,
     pub merchant_id: Uuid,
-    pub amount_ngn: Option<BigDecimal>,
-    pub bank_account: Option<String>,
-    pub bank_code: Option<String>,
-    pub account_name: Option<String>,
     pub status: String,
-    pub batch_id: Option<Uuid>,
-    pub estimated_processing_time: Option<DateTime<Utc>>,
     pub external_reference: Option<String>,
     pub provider: Option<String>,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+    pub settlement_currency: Option<String>,
+    pub recipient_wallet: Option<String>,
+    pub transaction_signature: Option<String>,
 }

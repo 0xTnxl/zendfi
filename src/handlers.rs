@@ -10,24 +10,28 @@ use bigdecimal::{BigDecimal, FromPrimitive};
 use crate::webhooks::{create_webhook_event, WebhookEventType};
 use crate::auth::AuthenticatedMerchant;
 use crate::{AppState, models::*};
-use rand::rngs::OsRng;
-use rand::Rng;
-use ed25519_dalek::SigningKey;
-use base64::Engine;
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce, Key
-};
-use argon2::Argon2;
-use zeroize::Zeroize;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use bigdecimal::ToPrimitive;
+use bip39::{Mnemonic, Language};
+use ed25519_dalek::Signer;
 
 pub async fn create_payment(
     State(state): State<AppState>,
     Extension(merchant): Extension<AuthenticatedMerchant>,
     Json(request): Json<CreatePaymentRequest>,
 ) -> Result<Json<PaymentResponse>, StatusCode> {
-    if request.amount <= 0.0 {
+    if request.amount <= 0.0 || request.amount > 1_000_000.0 {
         return Err(StatusCode::BAD_REQUEST);
+    }
+
+    if request.currency != "USD" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    if !check_merchant_limits(&state, merchant.merchant_id, request.amount).await? {
+        tracing::warn!("Merchant {} exceeded payment limits", merchant.merchant_id);
+        return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
     let token = match request.token.as_deref() {
@@ -36,32 +40,16 @@ pub async fn create_payment(
         _ => crate::solana::SupportedToken::Usdc,
     };
 
-    tracing::info!("Creating {} payment for ${} {} (merchant: {})", 
-                   format!("{:?}", token).to_uppercase(), 
-                   request.amount, 
-                   request.currency,
-                   merchant.merchant_id);
+    if token.get_mint_address(&state.config.solana_network).is_none() && !matches!(token, crate::solana::SupportedToken::Sol) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
-    let (amount_usd, amount_ngn) = if request.currency == "NGN" {
-        let rate = crate::exchange::get_current_rate(&state).await
-            .map_err(|e| {
-                tracing::error!("Failed to get exchange rate: {}", e);
-                StatusCode::SERVICE_UNAVAILABLE
-            })?;
-        let usd_amount = request.amount / rate.usd_to_ngn;
-        (usd_amount, Some(request.amount))
-    } else {
-        let rate = crate::exchange::get_current_rate(&state).await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let ngn_amount = request.amount * rate.usd_to_ngn;
-        (request.amount, Some(ngn_amount))
-    };
-    
+
+
+    let amount_usd = request.amount;
     let payment_id = Uuid::new_v4();
     let expires_at = chrono::Utc::now() + chrono::Duration::minutes(15);
     let amount_usd_bd = BigDecimal::from_f64(amount_usd).unwrap();
-    let amount_ngn_bd = amount_ngn.and_then(|n| BigDecimal::from_f64(n));
-
     let token_string = format!("{:?}", token).to_uppercase();
     
     let qr_code = crate::solana::generate_payment_qr(
@@ -75,35 +63,55 @@ pub async fn create_payment(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    tracing::info!("Generated {} payment QR: {}",
-        format!("{:?}", token).to_uppercase(),
-        qr_code);
-
+    let mut tx = state.db.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
     sqlx::query!(
         r#"
-        INSERT INTO payments (id, merchant_id, amount_usd, amount_ngn, status, metadata, 
-                             payment_token, sol_settlement_preference, created_at, expires_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        INSERT INTO payments (id, merchant_id, amount_usd, status, metadata, 
+                             payment_token, settlement_preference_override, created_at, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         "#,
         payment_id,
         merchant.merchant_id,
         amount_usd_bd,
-        amount_ngn_bd,
         PaymentStatus::Pending as PaymentStatus,
         request.metadata.unwrap_or(serde_json::json!({})),
         token_string,
-        request.sol_settlement_preference,
+        request.settlement_preference_override,
         chrono::Utc::now(),
         expires_at
     )
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         tracing::error!("Failed to create payment: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let _ = create_webhook_event(&state, payment_id, WebhookEventType::PaymentCreated).await;
+    // Audit log
+    sqlx::query!(
+        r#"
+        INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by)
+        VALUES ('payments', $1, 'INSERT', $2, $3)
+        "#,
+        payment_id,
+        serde_json::json!({
+            "amount_usd": amount_usd,
+            "payment_token": token_string,
+            "merchant_id": merchant.merchant_id
+        }),
+        merchant.merchant_id
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Create webhook event
+    if let Err(e) = crate::webhooks::create_webhook_event(&state, payment_id, crate::webhooks::WebhookEventType::PaymentCreated).await {
+        tracing::error!("Failed to create webhook event: {}", e);
+    }
     
     Ok(Json(PaymentResponse {
         id: payment_id,
@@ -115,6 +123,79 @@ pub async fn create_payment(
         expires_at,
         settlement_info: None,
     }))
+}
+
+async fn check_merchant_limits(
+    state: &AppState,
+    merchant_id: Uuid,
+    amount: f64,
+) -> Result<bool, StatusCode> {
+    let limits = sqlx::query!(
+        r#"
+        SELECT max_payment_amount, daily_volume_limit, rate_limit_per_hour
+        FROM merchant_limits 
+        WHERE merchant_id = $1 AND is_active = true
+        "#,
+        merchant_id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let (max_payment, daily_limit, hourly_rate) = if let Some(l) = limits {
+        (
+            l.max_payment_amount.to_f64().unwrap_or(10000.0),
+            l.daily_volume_limit.to_f64().unwrap_or(50000.0),
+            l.rate_limit_per_hour
+        )
+    } else {
+        (10000.0, 50000.0, 100)
+    };
+
+    if amount > max_payment {
+        return Ok(false);
+    }
+
+    let today_volume = sqlx::query!(
+        r#"
+        SELECT COALESCE(SUM(amount_usd), 0) as daily_volume
+        FROM payments 
+        WHERE merchant_id = $1 
+          AND created_at >= CURRENT_DATE 
+          AND status IN ('pending', 'confirmed')
+        "#,
+        merchant_id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let daily_volume_f64 = today_volume.daily_volume
+        .and_then(|v| v.to_f64())
+        .unwrap_or(0.0);
+        
+    if daily_volume_f64 + amount > daily_limit {
+        return Ok(false);
+    }
+
+    let hourly_count = sqlx::query!(
+        r#"
+        SELECT COUNT(*) as hourly_count
+        FROM payments 
+        WHERE merchant_id = $1 
+          AND created_at >= NOW() - INTERVAL '1 hour'
+        "#,
+        merchant_id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if hourly_count.hourly_count.unwrap_or(0) >= hourly_rate as i64 {
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 pub async fn confirm_payment(
@@ -152,9 +233,8 @@ pub async fn get_payment(
 ) -> Result<Json<Payment>, StatusCode> {
     let payment = sqlx::query_as!(
         Payment,
-        r#"SELECT id, merchant_id, amount_usd, amount_ngn, 
-                  status as "status: PaymentStatus", transaction_signature, 
-                  customer_wallet, metadata, created_at, expires_at
+        r#"SELECT id, merchant_id, amount_usd, status as "status: PaymentStatus",
+           transaction_signature, customer_wallet, metadata, created_at, expires_at
            FROM payments WHERE id = $1"#,
         id
     )
@@ -186,74 +266,63 @@ pub async fn create_merchant(
     State(state): State<AppState>,
     Json(request): Json<CreateMerchantRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if let Some(ref wallet_addr) = request.wallet_address {
-        if crate::solana::validate_solana_address(wallet_addr).is_err() {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    }
-
-    if let Some(ref bank_code) = request.bank_code {
-        if !is_valid_nigerian_bank_code(bank_code) {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    }
-
     if let Some(ref webhook_url) = request.webhook_url {
         if !is_valid_webhook_url(webhook_url).await {
             tracing::warn!("Invalid webhook URL provided: {}", webhook_url);
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    }
-
-    let settlement_pref = request.settlement_preference
-        .as_deref()
-        .map(SettlementPreference::from)
-        .unwrap_or(SettlementPreference::AutoNgn);
-
-    match settlement_pref {
-        SettlementPreference::AutoNgn | SettlementPreference::PerPayment => {
-            if request.bank_account_number.is_none() || request.bank_code.is_none() {
-                return Err(StatusCode::BAD_REQUEST);
-            }
-        }
-        SettlementPreference::AutoUsdc => {
-            // USDC-only merchants don't need bank details
         }
     }
 
     let merchant_id = Uuid::new_v4();
 
-    let (merchant_wallet, wallet_generated) = if let Some(provided_wallet) = request.wallet_address {
+    let (merchant_wallet, wallet_generated, generation_method) = if let Some(provided_wallet) = request.wallet_address {
         crate::solana::validate_solana_address(&provided_wallet)
             .map_err(|_| StatusCode::BAD_REQUEST)?;
-        (provided_wallet, false)
+        (provided_wallet, false, "provided".to_string())
     } else {
-        let (wallet_pubkey, _keypair_path) = generate_merchant_wallet(&merchant_id, &state.config).await
-        .map_err(|e| {
-            tracing::error!("Failed to generate merchant wallet: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-        (wallet_pubkey, true)
+        let method = request.wallet_generation_method
+            .as_deref()
+            .unwrap_or("simple");
+
+        match method {
+            "mnemonic" => {
+                let wallet_pubkey = generate_merchant_wallet_from_mnemonic(&merchant_id, &state).await
+                    .map_err(|e| {
+                        tracing::error!("Failed to generate mnemonic wallet: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+                (wallet_pubkey, true, "mnemonic".to_string())
+            }
+            _ => {
+                // Default to simple generation
+                let wallet_pubkey = generate_simple_merchant_wallet(&merchant_id, &state).await
+                    .map_err(|e| {
+                        tracing::error!("Failed to generate simple wallet: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+                (wallet_pubkey, true, "simple".to_string())
+            }
+        }
     };
 
-    let merchant = sqlx::query!(
+    let settlement_preference = request.settlement_preference
+        .as_deref()
+        .map(SettlementPreference::from)
+        .unwrap_or(SettlementPreference::AutoUsdc);
+
+    let _merchant = sqlx::query!(
         r#"
         INSERT INTO merchants 
         (id, name, email, wallet_address, settlement_preference, wallet_generated,
-         bank_account_number, bank_code, account_name, business_address,
-         webhook_url, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
+         business_address, webhook_url, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
         RETURNING id, name, email, wallet_address
         "#,
         merchant_id,
         request.name,
         request.email,
         merchant_wallet,
-        format!("{:?}", settlement_pref).to_lowercase(), 
+        format!("{:?}", settlement_preference).to_lowercase(), 
         wallet_generated,
-        request.bank_account_number,
-        request.bank_code,
-        request.account_name,
         request.business_address,
         request.webhook_url,
         chrono::Utc::now()
@@ -270,164 +339,162 @@ pub async fn create_merchant(
     
     Ok(Json(serde_json::json!({
         "merchant": {
-            "id": merchant.id,
-            "name": merchant.name,
-            "email": merchant.email,
-            "wallet_address": merchant.wallet_address,
-            "wallet_generated": wallet_generated
+            "id": merchant_id,
+            "name": request.name,
+            "wallet_address": merchant_wallet,
+            "settlement_preference": format!("{:?}", settlement_preference).to_lowercase(),
+            "wallet_generation_method": generation_method
         },
         "api_key": api_key,
-        "message": format!(
-            "Merchant created successfully. Settlements will be processed to {}.", 
-            match settlement_pref {
-                SettlementPreference::AutoNgn => "your NGN bank account",
-                SettlementPreference::AutoUsdc => "your USDC wallet", 
-                SettlementPreference::PerPayment => "NGN or USDC based on payment settings"
-            }
-        ),
+        "message": match generation_method.as_str() {
+            "mnemonic" => "Merchant created with BIP39 mnemonic-derived wallet! Store your master mnemonic securely.",
+            "simple" => "Merchant created with secure deterministic wallet! Your wallet is secured by our enterprise key management.",
+            "provided" => "Merchant created with your provided wallet address.",
+            _ => "Merchant created successfully!"
+        },
+        "security_note": match generation_method.as_str() {
+            "mnemonic" => "Your wallet can be recovered using the master mnemonic phrase. Keep it secure!",
+            "simple" => "Your wallet is derived deterministically from secure system keys.",
+            "provided" => "You control your wallet private keys directly.",
+            _ => ""
+        },
         "warning": "Store this API key securely. It will not be shown again."
     })))
 }
 
-async fn generate_merchant_wallet(
+async fn generate_simple_merchant_wallet(
     merchant_id: &Uuid,
-    config: &crate::config::Config,
-) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-    let signing_key = SigningKey::generate(&mut OsRng);
+    state: &AppState,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let master_secret = std::env::var("SOLAPAY_MASTER_SEED")
+        .unwrap_or_else(|_| "default-insecure-seed-change-this".to_string());
+    
+    let mut mac = Hmac::<Sha256>::new_from_slice(master_secret.as_bytes())?;
+    mac.update(merchant_id.as_bytes());
+    let seed = mac.finalize();
+
+    let seed_bytes: [u8; 32] = seed.into_bytes().into();
+
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed_bytes);
     let verifying_key = signing_key.verifying_key();
-    
-    let public_key_bytes = verifying_key.to_bytes();
-    let address = bs58::encode(public_key_bytes).into_string();
-    
-    let keypair_data = serde_json::json!({
-        "public_key": address,
-        "private_key": hex::encode(signing_key.to_bytes()),
-        "merchant_id": merchant_id,
-        "created_at": chrono::Utc::now(),
-        "algorithm": "ed25519",
-        "curve": "curve25519",
-        "version": "1.0"
-    });
+    let public_key = bs58::encode(verifying_key.to_bytes()).into_string();
 
-    let keypair_dir = &config.merchant_wallet_dir;
-    std::fs::create_dir_all(keypair_dir)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(keypair_dir)?.permissions();
-        perms.set_mode(0o700); // rwx------
-        std::fs::set_permissions(keypair_dir, perms)?;
-    }
+    store_wallet_metadata(merchant_id, &public_key, 0, "simple", state).await?;
     
-    let keypair_path = format!("{}/{}.json", keypair_dir, merchant_id);
+    tracing::info!("Generated wallet {} for merchant {}", public_key, merchant_id);
     
-    let encrypted_data = encrypt_keypair_data(&keypair_data.to_string(), merchant_id)?;
-    std::fs::write(&keypair_path, encrypted_data)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&keypair_path)?.permissions();
-        perms.set_mode(0o600); // rw-------
-        std::fs::set_permissions(&keypair_path, perms)?;
-    }
-    
-    tracing::info!("Generated secure Solana wallet {} for merchant {}", address, merchant_id);
-    
-    Ok((address, keypair_path))
+    Ok(public_key)
 }
 
-fn encrypt_keypair_data(data: &str, merchant_id: &Uuid) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let master_key = std::env::var("SOLAPAY_MASTER_KEY")
-        .unwrap_or_else(|_| "solapay_default_key_change_in_production".to_string());
-    
-    let salt = format!("solapay_salt_{}", merchant_id);
-    let argon2 = Argon2::default();
+async fn generate_merchant_wallet_from_mnemonic(
+    merchant_id: &Uuid,
+    state: &AppState,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let mnemonic_phrase = std::env::var("ZENDFI_MASTER_MNEMONIC")
+        .map_err(|_| "ZENDFI_MASTER_MNEMONIC environment variable must be set")?;
 
-    let mut derived_key = [0u8; 32];
-    argon2.hash_password_into(
-        master_key.as_bytes(),
-        salt.as_bytes(),
-        &mut derived_key
-    ).map_err(|e| format!("Key derivation failed: {}", e))?;
+    let mnemonic = Mnemonic::parse_in_normalized(Language::English, &mnemonic_phrase)
+        .map_err(|e| format!("Invalid mnemonic phrase: {}", e))?;
+
+    let passphrase = format!("merchant_{}", merchant_id);
+    let seed = mnemonic.to_seed(&passphrase);
+
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&seed[..32]);
+
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
+    let verifying_key = signing_key.verifying_key();
+    let public_key = bs58::encode(verifying_key.to_bytes()).into_string();
+
+    let merchant_index = get_merchant_derivation_index(merchant_id, state).await?;
+
+    store_wallet_metadata(merchant_id, &public_key, merchant_index, "mnemonic-derived", state).await?;
     
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived_key));
-    let nonce_bytes = aes_gcm::aead::OsRng.gen::<[u8; 12]>();
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    tracing::info!("Generated mnemonic-derived wallet {} for merchant {}", public_key, merchant_id);
     
-    let ciphertext = cipher.encrypt(nonce, data.as_bytes())
-        .map_err(|e| format!("Encryption failed: {}", e))?;
-    
-    let mut encrypted_data = Vec::new();
-    encrypted_data.extend_from_slice(&nonce_bytes);
-    encrypted_data.extend_from_slice(&ciphertext);
-    
-    let mut derived_key_mut = derived_key;
-    derived_key_mut.zeroize();
-    
-    Ok(base64::engine::general_purpose::STANDARD.encode(encrypted_data))
+    Ok(public_key)
 }
 
-fn decrypt_keypair_data(encrypted: &str, merchant_id: &Uuid) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let master_key = std::env::var("SOLAPAY_MASTER_KEY")
-        .unwrap_or_else(|_| "solapay_default_key_change_in_production".to_string());
+async fn get_merchant_derivation_index(
+    _merchant_id: &Uuid,
+    state: &AppState
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    let result = sqlx::query!(
+        "SELECT COALESCE(MAX(derivation_index), 0) + 1 as next_index FROM merchant_wallets"
+    )
+    .fetch_one(&state.db)
+    .await?;
     
-    let salt = format!("solapay_salt_{}", merchant_id);
-    let argon2 = Argon2::default();
-    
-    let mut derived_key = [0u8; 32];
-    argon2.hash_password_into(
-        master_key.as_bytes(),
-        salt.as_bytes(),
-        &mut derived_key
-    ).map_err(|e| format!("Key derivation failed: {}", e))?;
+    Ok(result.next_index.unwrap_or(1) as u32)
+}
 
-    let encrypted_data = base64::engine::general_purpose::STANDARD.decode(encrypted)?;
+async fn store_wallet_metadata(
+    merchant_id: &Uuid,
+    public_key: &str,
+    derivation_index: u32,
+    derivation_path: &str,
+    state: &AppState
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sqlx::query!(
+        r#"
+        INSERT INTO merchant_wallets 
+        (merchant_id, public_key, derivation_index, derivation_path, created_at)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+        merchant_id,
+        public_key,
+        derivation_index as i32,
+        derivation_path,
+        chrono::Utc::now()
+    )
+    .execute(&state.db)
+    .await?;
     
-    if encrypted_data.len() < 12 {
-        return Err("Invalid encrypted data: too short".into());
-    }
-
-    let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
-    let nonce = Nonce::from_slice(nonce_bytes);
-
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived_key));
-    let plaintext = cipher.decrypt(nonce, ciphertext)
-        .map_err(|e| format!("Decryption failed: {}", e))?;
-    
-    let mut derived_key_mut = derived_key;
-    derived_key_mut.zeroize();
-    
-    Ok(String::from_utf8(plaintext)?)
+    Ok(())
 }
 
 #[allow(dead_code)]
-async fn load_merchant_keypair(merchant_id: &Uuid) -> Result<SigningKey, Box<dyn std::error::Error + Send + Sync>> {
-    let keypair_path = format!("/secure/merchant_wallets/{}.json", merchant_id);
-    
-    let encrypted_data = std::fs::read_to_string(&keypair_path)?;
-    let decrypted_json = decrypt_keypair_data(&encrypted_data, merchant_id)?;
-    
-    let keypair_info: serde_json::Value = serde_json::from_str(&decrypted_json)?;
-    let private_key_hex = keypair_info["private_key"]
-        .as_str()
-        .ok_or("Missing private key in keypair data")?;
-    
-    let private_key_bytes = hex::decode(private_key_hex)?;
-    let signing_key = SigningKey::from_bytes(&private_key_bytes.try_into()
-        .map_err(|_| "Invalid private key length")?);
-    
-    Ok(signing_key)
-}
+// This function is not useless, it's intended for future development of merchant-controlled settlements
+pub async fn sign_settlement_transaction(
+    state: &AppState,
+    merchant_id: Uuid,
+    transaction_data: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let wallet_info = sqlx::query!(
+        "SELECT derivation_path FROM merchant_wallets WHERE merchant_id = $1",
+        merchant_id
+    )
+    .fetch_one(&state.db)
+    .await?;
 
-fn is_valid_nigerian_bank_code(bank_code: &str) -> bool {
-    let valid_codes = [
-        "044", "023", "063", "050", "070", "011", "058", "076", "082", "084",
-        "221", "068", "057", "032", "033", "215", "035", "039", "040", "214",
-        "090175", "090110", "090134", "090149", "090097"
-    ];
-    valid_codes.contains(&bank_code)
+    let signature = if wallet_info.derivation_path == "simple" {
+        let master_secret = std::env::var("SOLAPAY_MASTER_SEED")
+            .unwrap_or_else(|_| "default-insecure-seed-change-this".to_string());
+        
+        let mut mac = Hmac::<Sha256>::new_from_slice(master_secret.as_bytes())?;
+        mac.update(merchant_id.as_bytes());
+        let seed = mac.finalize();
+
+        let seed_bytes: [u8; 32] = seed.into_bytes().into();
+        
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed_bytes);
+        signing_key.sign(transaction_data)
+    } else if wallet_info.derivation_path == "mnemonic-derived" {
+        let mnemonic_phrase = std::env::var("ZENDFI_MASTER_MNEMONIC")?;
+        let mnemonic = Mnemonic::parse_in_normalized(Language::English, &mnemonic_phrase)?;
+        let passphrase = format!("merchant_{}", merchant_id);
+        let seed = mnemonic.to_seed(&passphrase);
+        
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(&seed[..32]);
+        
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
+        signing_key.sign(transaction_data)
+    } else {
+        return Err("Unknown wallet derivation method".into());
+    };
+    
+    Ok(signature.to_bytes().to_vec())
 }
 
 async fn is_valid_webhook_url(url: &str) -> bool {
@@ -525,7 +592,6 @@ fn is_testing_webhook_url(url: &str) -> bool {
     testing_domains.iter().any(|domain| url.contains(domain))
 }
 
-
 async fn perform_lightweight_webhook_check(url: &str) -> bool {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -544,66 +610,6 @@ async fn perform_lightweight_webhook_check(url: &str) -> bool {
     }
 }
 
-pub async fn get_settlement_status(
-    State(state): State<AppState>,
-    Path(payment_id): Path<Uuid>,
-    Extension(merchant): Extension<AuthenticatedMerchant>,
-) -> Result<Json<crate::models::Settlement>, StatusCode> {
-    let settlement = sqlx::query_as!(
-        crate::models::Settlement,
-        r#"SELECT id, payment_id, 
-                  COALESCE(payment_token, 'USDC') as "payment_token!: String",
-                  COALESCE(settlement_token, 'NGN') as "settlement_token!: String", 
-                  COALESCE(amount_recieved, 0) as "amount_recieved!: BigDecimal",
-                  COALESCE(amount_settled, amount_ngn) as "amount_settled!: BigDecimal",
-                  exchange_rate_used,
-                  sol_swap_signature,
-                  merchant_id, amount_ngn, bank_account, bank_code, 
-                  account_name, status, batch_id, estimated_processing_time,
-                  external_reference, provider, created_at, completed_at
-           FROM settlements WHERE payment_id = $1"#,
-        payment_id
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|_| StatusCode::NOT_FOUND)?;
-
-    if settlement.merchant_id != merchant.merchant_id {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    
-    Ok(Json(settlement))
-}
-
-pub async fn list_settlements(
-    State(state): State<AppState>,
-    Extension(merchant): Extension<AuthenticatedMerchant>,
-) -> Result<Json<Vec<crate::models::Settlement>>, StatusCode> {
-    let settlements = sqlx::query_as!(
-        crate::models::Settlement,
-        r#"SELECT id, payment_id,
-                  COALESCE(payment_token, 'USDC') as "payment_token!: String",
-                  COALESCE(settlement_token, 'NGN') as "settlement_token!: String",
-                  COALESCE(amount_recieved, 0) as "amount_recieved!: BigDecimal", 
-                  COALESCE(amount_settled, amount_ngn) as "amount_settled!: BigDecimal",
-                  exchange_rate_used,
-                  sol_swap_signature,
-                  merchant_id, amount_ngn, bank_account, bank_code, 
-                  account_name, status, batch_id, estimated_processing_time,
-                  external_reference, provider, created_at, completed_at
-           FROM settlements 
-           WHERE merchant_id = $1 
-           ORDER BY created_at DESC 
-           LIMIT 50"#,
-        merchant.merchant_id
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-    Ok(Json(settlements))
-}
-
 pub async fn get_merchant_dashboard(
     State(state): State<AppState>,
     Extension(merchant): Extension<AuthenticatedMerchant>,
@@ -611,11 +617,10 @@ pub async fn get_merchant_dashboard(
     let stats = sqlx::query!(
         r#"
         SELECT 
-            SUM(CASE WHEN status = 'confirmed' THEN COALESCE(amount_usd, 0) ELSE 0 END) as total_volume_usd,
-            SUM(CASE WHEN status = 'confirmed' THEN COALESCE(amount_ngn, 0) ELSE 0 END) as total_volume_ngn,
             COUNT(*) as total_transactions,
-            COUNT(CASE WHEN status = 'confirmed' THEN 1 END) as successful_transactions,
-            COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_transactions
+            COUNT(*) FILTER (WHERE status = 'confirmed') as successful_transactions,
+            COUNT(*) FILTER (WHERE status = 'pending') as pending_transactions,
+            COALESCE(SUM(amount_usd), 0) as total_volume_usd
         FROM payments 
         WHERE merchant_id = $1
         "#,
@@ -632,16 +637,13 @@ pub async fn get_merchant_dashboard(
     };
 
     let total_volume_usd = stats.total_volume_usd
-        .map(|bd| bd.to_string().parse::<f64>().unwrap_or(0.0))
-        .unwrap_or(0.0);
-    let total_volume_ngn = stats.total_volume_ngn
-        .map(|bd| bd.to_string().parse::<f64>().unwrap_or(0.0))
+        .and_then(|v| v.to_f64())
         .unwrap_or(0.0);
     
     Ok(Json(MerchantDashboard {
         merchant_id: merchant.merchant_id,
         total_volume_usd,
-        total_volume_ngn,
+        total_volume_ngn: 0.0, 
         total_transactions: stats.total_transactions.unwrap_or(0),
         successful_transactions: stats.successful_transactions.unwrap_or(0),
         pending_transactions: stats.pending_transactions.unwrap_or(0),
@@ -649,45 +651,23 @@ pub async fn get_merchant_dashboard(
     }))
 }
 
-pub async fn get_exchange_rates(
-    State(state): State<AppState>,
-) -> Result<Json<ExchangeRate>, StatusCode> {
-    let rate = crate::exchange::get_current_rate(&state).await
-        .map_err(|e| {
-            tracing::error!("Failed to get exchange rate: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    
-    Ok(Json(rate))
-}
-
 pub async fn system_health(State(state): State<AppState>) -> Json<serde_json::Value> {
     let db_healthy = check_database_health(&state.db).await;
     let solana_stats = state.solana_client.get_endpoint_stats().await;
-    let exchange_healthy = crate::exchange::get_current_rate(&state).await.is_ok();
-    
     let solana_healthy = solana_stats.iter().any(|(_, health)| health.consecutive_failures < 3);
     
     let system_metrics = get_system_metrics(&state.db).await;
     
     Json(serde_json::json!({
-        "status": if db_healthy && solana_healthy && exchange_healthy { "healthy" } else { "degraded" },
+        "status": if db_healthy && solana_healthy { "healthy" } else { "degraded" },
         "services": {
             "database": if db_healthy { "up" } else { "down" },
-            "solana_endpoints": solana_stats.iter().map(|(url, health)| {
-                serde_json::json!({
-                    "url": url,
-                    "status": if health.consecutive_failures < 3 { "up" } else { "down" },
-                    "success_rate": health.success_rate,
-                    "avg_latency_ms": health.avg_latency_ms,
-                    "consecutive_failures": health.consecutive_failures
-                })
-            }).collect::<Vec<_>>(),
-            "exchange_api": if exchange_healthy { "up" } else { "down" }
+            "solana_rpc": if solana_healthy { "up" } else { "degraded" },
+            "jupiter_dex": "up"
         },
         "metrics": system_metrics,
         "timestamp": chrono::Utc::now(),
-        "version": "0.1.0"
+        "version": "0.2.0 - Direct Crypto Only"
     }))
 }
 
@@ -695,12 +675,12 @@ async fn get_system_metrics(db: &sqlx::PgPool) -> serde_json::Value {
     let stats = sqlx::query!(
         r#"
         SELECT 
-            COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending,
-            COUNT(CASE WHEN status = 'confirmed' THEN 1 END) as confirmed,
-            COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed,
-            COUNT(CASE WHEN created_at > NOW() - INTERVAL '24 hours' THEN 1 END) as payments_24h,
-            COUNT(CASE WHEN created_at > NOW() - INTERVAL '1 hour' THEN 1 END) as payments_1h
+            COUNT(*) as total_payments,
+            COUNT(*) FILTER (WHERE status = 'confirmed') as confirmed_payments,
+            COUNT(*) FILTER (WHERE status = 'pending') as pending_payments,
+            COALESCE(SUM(amount_usd), 0) as total_volume
         FROM payments
+        WHERE created_at >= NOW() - INTERVAL '24 hours'
         "#
     )
     .fetch_optional(db)
@@ -709,23 +689,19 @@ async fn get_system_metrics(db: &sqlx::PgPool) -> serde_json::Value {
 
     if let Some(row) = stats {
         serde_json::json!({
-            "payments": {
-                "pending": row.pending.unwrap_or(0),
-                "confirmed": row.confirmed.unwrap_or(0),
-                "failed": row.failed.unwrap_or(0),
-                "last_24h": row.payments_24h.unwrap_or(0),
-                "last_1h": row.payments_1h.unwrap_or(0)
-            }
+            "total_payments_24h": row.total_payments.unwrap_or(0),
+            "confirmed_payments_24h": row.confirmed_payments.unwrap_or(0),
+            "pending_payments_24h": row.pending_payments.unwrap_or(0),
+            "total_volume_24h": row.total_volume
+                .and_then(|v| v.to_f64())
+                .unwrap_or(0.0)
         })
     } else {
         serde_json::json!({
-            "payments": {
-                "pending": 0,
-                "confirmed": 0,
-                "failed": 0,
-                "last_24h": 0,
-                "last_1h": 0
-            }
+            "total_payments_24h": 0,
+            "confirmed_payments_24h": 0,
+            "pending_payments_24h": 0,
+            "total_volume_24h": 0.0
         })
     }
 }

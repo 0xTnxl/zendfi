@@ -8,8 +8,6 @@ use axum::{
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-
-
 mod auth;
 mod models;
 mod handlers;
@@ -17,8 +15,6 @@ mod solana;
 mod sol_client;
 mod settlements;
 mod database;
-mod quidax;
-mod exchange;
 mod config;
 mod webhooks;
 
@@ -67,8 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
     };
 
-    let batch_state = state.clone();
-    tokio::spawn(crate::settlements::start_settlement_batch_worker(batch_state));
+
 
     match test_solana_connection(&state.solana_rpc_url).await {
         Ok(_) => tracing::info!("Connected to Solana RPC"),
@@ -81,17 +76,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let monitor_state = state.clone();
     tokio::spawn(solana::start_payment_monitor(monitor_state));
 
-    let admin_routes = Router::new()
-        .route("/admin/settlements/pending", get(settlements::get_pending_manual_settlements))
-        .route("/admin/settlements/:id/complete", post(settlements::mark_settlement_completed))
-        .with_state(state.clone());
 
     let public_routes = Router::new()
         .route("/health", get(health_check))
         .route("/system/health", get(system_health))
         .route("/", get(root_handler))
         .route("/api/v1/merchants", post(create_merchant))
-        .route("/api/v1/rates", get(get_exchange_rates))
         .with_state(state.clone());
 
     let protected_routes = Router::new()
@@ -99,8 +89,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/payments/:id", get(get_payment))
         .route("/api/v1/payments/:id/status", get(get_payment_status))
         .route("/api/v1/payments/:id/confirm", post(confirm_payment))
-        .route("/api/v1/payments/:id/settlement", get(get_settlement_status))
-        .route("/api/v1/settlements", get(list_settlements))
         .route("/api/v1/dashboard", get(get_merchant_dashboard))
         .route("/api/v1/webhooks", get(webhooks::list_webhook_events))
         .route("/api/v1/webhooks/:id/retry", post(webhooks::retry_webhook))
@@ -110,7 +98,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Combine the routers
     let app = Router::new()
         .merge(public_routes)
-        .merge(admin_routes)
         .merge(protected_routes)
         .layer(middleware::from_fn(cors_layer));
     

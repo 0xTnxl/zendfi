@@ -39,8 +39,6 @@ pub enum WebhookEventType {
     PaymentConfirmed,
     PaymentFailed,
     PaymentExpired,
-    SettlementQueued,
-    SettlementProcessing,
     SettlementCompleted,
 }
 
@@ -73,7 +71,6 @@ pub struct PaymentWebhookData {
     pub metadata: serde_json::Value,
 }
 
-// Webhook signature generation for security
 pub fn generate_webhook_signature(payload: &str, secret: &str) -> String {
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
         .expect("HMAC can take key of any size");
@@ -84,7 +81,6 @@ pub fn generate_webhook_signature(payload: &str, secret: &str) -> String {
 }
 
 #[allow(dead_code)]
-// Verify incoming webhook signatures (for webhook endpoints)
 pub fn verify_webhook_signature(payload: &str, signature: &str, secret: &str) -> bool {
     let expected_signature = generate_webhook_signature(payload, secret);
     signature.as_bytes().ct_eq(expected_signature.as_bytes()).into()
@@ -95,8 +91,26 @@ pub async fn create_webhook_event(
     payment_id: Uuid,
     event_type: WebhookEventType,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let idempotency_key = format!("{}_{:?}", payment_id, event_type);
+
+    let existing = sqlx::query!(
+        r#"
+        SELECT id FROM webhook_events 
+        WHERE payment_id = $1 AND event_type = $2
+        "#,
+        payment_id,
+        event_type.clone() as WebhookEventType
+    )
+    .fetch_optional(&state.db)
+    .await?;
+
+    if existing.is_some() {
+        tracing::debug!("Webhook event already exists for payment {} and type {:?}", payment_id, event_type);
+        return Ok(());
+    }
+
     let payment = sqlx::query!(
-        r#"SELECT id, merchant_id, amount_usd, amount_ngn, 
+        r#"SELECT id, merchant_id, amount_usd,
                   status as "status: PaymentStatus", transaction_signature, 
                   customer_wallet, metadata, created_at, expires_at 
            FROM payments WHERE id = $1"#,
@@ -113,25 +127,21 @@ pub async fn create_webhook_event(
     .fetch_one(&state.db)
     .await?;
 
-    // Skip only if the merchant has no webhook URL
     let webhook_url = match merchant.webhook_url {
         Some(url) => url,
         None => {
-            tracing::info!("No webhook URL configured for merchant {}", merchant.id);
+            tracing::debug!("No webhook URL configured for merchant {}", merchant.id);
             return Ok(());
         }
     };
 
-    // Convert BigDecimal to f64 for the webhook payload
     let amount_usd_f64 = payment.amount_usd.to_f64().unwrap_or(0.0);
-    let amount_ngn_f64 = payment.amount_ngn.and_then(|bd| bd.to_f64());
 
-    // Create webhook payload
     let webhook_data = PaymentWebhookData {
         id: payment.id,
         merchant_id: payment.merchant_id,
         amount_usd: amount_usd_f64,
-        amount_ngn: amount_ngn_f64,
+        amount_ngn: None,
         status: payment.status,
         transaction_signature: payment.transaction_signature,
         customer_wallet: payment.customer_wallet,
@@ -145,13 +155,12 @@ pub async fn create_webhook_event(
         signature: String::new(),
     };
 
-    // Store webhook event in database
     let webhook_id = Uuid::new_v4();
     sqlx::query!(
         r#"
         INSERT INTO webhook_events 
-        (id, payment_id, merchant_id, event_type, payload, webhook_url, status, attempts, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        (id, payment_id, merchant_id, event_type, payload, webhook_url, status, attempts, idempotency_key, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
         webhook_id,
         payment_id,
@@ -161,6 +170,7 @@ pub async fn create_webhook_event(
         webhook_url,
         WebhookStatus::Pending as WebhookStatus,
         0,
+        idempotency_key,
         Utc::now()
     )
     .execute(&state.db)
@@ -170,6 +180,8 @@ pub async fn create_webhook_event(
 
     Ok(())
 }
+
+
 
 async fn get_webhook_event(state: &AppState, webhook_id: Uuid) -> Result<WebhookEvent, sqlx::Error> {
     sqlx::query_as!(
@@ -207,31 +219,26 @@ pub async fn deliver_webhook(state: AppState, webhook_id: Uuid) {
         }
     };
 
-    // Don't retry if already delivered or exhausted
     if matches!(webhook.status, WebhookStatus::Delivered | WebhookStatus::Exhausted) {
         return;
     }
 
     let attempt_count = webhook.attempts + 1;
     
-    // Check if we've exceeded max retries
     if attempt_count > MAX_RETRIES {
         let _ = mark_webhook_exhausted(&state, webhook_id).await;
         tracing::error!("Webhook {} exhausted after {} attempts", webhook_id, MAX_RETRIES);
         return;
     }
 
-    // Generate signature
     let payload_json = serde_json::to_string(&webhook.payload).unwrap();
     let merchant_secret = format!("webhook_secret_{}", webhook.merchant_id);
     let signature = generate_webhook_signature(&payload_json, &merchant_secret);
 
-    // Update payload with signature
     let mut payload: WebhookPayload = serde_json::from_value(webhook.payload).unwrap();
     payload.signature = signature.clone();
     let signed_payload = serde_json::to_string(&payload).unwrap();
 
-    // Attempt delivery
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -276,7 +283,6 @@ pub async fn deliver_webhook(state: AppState, webhook_id: Uuid) {
                 
                 tracing::info!("Webhook {} delivered successfully", webhook_id);
             } else {
-                // Direct call instead of await to avoid Send issues
                 let _ = update_webhook_failed(&state, webhook_id, attempt_count, status_code, response_body).await;
             }
         }
@@ -287,14 +293,12 @@ pub async fn deliver_webhook(state: AppState, webhook_id: Uuid) {
     }
 }
 
-// This function handles background tasks to retry failed webhooks
 pub async fn webhook_retry_worker(state: AppState) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     
     loop {
         interval.tick().await;
-        
-        // Find webhooks that need retry
+
         let webhooks = sqlx::query!(
             r#"
             SELECT id FROM webhook_events 
@@ -320,7 +324,8 @@ async fn update_webhook_failed(
     response_code: i32,
     response_body: String,
 ) -> Result<(), sqlx::Error> {
-    let delay_seconds = 2_u64.pow((attempt_count - 1) as u32);
+    // Cap exponential backoff at 1 hour
+    let delay_seconds = std::cmp::min(2_u64.pow((attempt_count - 1) as u32), 3600);
     let next_retry = Utc::now() + chrono::Duration::seconds(delay_seconds as i64);
 
     sqlx::query!(
@@ -334,7 +339,7 @@ async fn update_webhook_failed(
         Utc::now(),
         next_retry,
         if response_code > 0 { Some(response_code) } else { None },
-        response_body,
+        response_body.chars().take(1000).collect::<String>(), 
         webhook_id
     )
     .execute(&state.db)
@@ -348,7 +353,6 @@ async fn update_webhook_failed(
     Ok(())
 }
 
-// API endpoints for webhook management
 pub async fn list_webhook_events(
     State(state): State<AppState>,
     axum::Extension(merchant): axum::Extension<AuthenticatedMerchant>,

@@ -36,4 +36,7 @@ spl-token = "6.0"
 spl-associated-token-account = "4.0"
 spl-memo = { version = "6.0", default-features = false, features = ["no-entrypoint"] }
 once_cell = "1.21.3"
+bincode = "1.3"
+bip32 = { version = "0.5", features = ["bip39"] }
+bip39 = { version = "2.0", features = ["std"] }
 
