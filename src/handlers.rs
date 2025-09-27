@@ -390,8 +390,8 @@ async fn generate_merchant_wallet_from_mnemonic(
     merchant_id: &Uuid,
     state: &AppState,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let mnemonic_phrase = std::env::var("ZENDFI_MASTER_MNEMONIC")
-        .map_err(|_| "ZENDFI_MASTER_MNEMONIC environment variable must be set")?;
+    let mnemonic_phrase = std::env::var("SOLAPAY_MASTER_MNEMONIC")
+        .map_err(|_| "SOLAPAY_MASTER_MNEMONIC environment variable must be set")?;
 
     let mnemonic = Mnemonic::parse_in_normalized(Language::English, &mnemonic_phrase)
         .map_err(|e| format!("Invalid mnemonic phrase: {}", e))?;
@@ -480,7 +480,7 @@ pub async fn sign_settlement_transaction(
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed_bytes);
         signing_key.sign(transaction_data)
     } else if wallet_info.derivation_path == "mnemonic-derived" {
-        let mnemonic_phrase = std::env::var("ZENDFI_MASTER_MNEMONIC")?;
+        let mnemonic_phrase = std::env::var("SOLAPAY_MASTER_MNEMONIC")?;
         let mnemonic = Mnemonic::parse_in_normalized(Language::English, &mnemonic_phrase)?;
         let passphrase = format!("merchant_{}", merchant_id);
         let seed = mnemonic.to_seed(&passphrase);

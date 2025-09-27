@@ -102,7 +102,7 @@ async fn process_direct_token_settlement(
         INSERT INTO settlements 
         (id, payment_id, payment_token, settlement_token, amount_recieved, amount_settled,
          settlement_currency, recipient_wallet, merchant_id, status, provider, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'processing', 'zendfi_direct', $10)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'processing', 'solapay_direct', $10)
         "#,
         settlement_id,
         payment_id,
@@ -149,7 +149,7 @@ async fn process_usdc_settlement(
         amount_usd
     };
 
-    let (merchant_receives_usdc, _zendfi_fee) = calculate_settlement_amounts(final_usdc_amount).await?;
+    let (merchant_receives_usdc, _solapay_fee) = calculate_settlement_amounts(final_usdc_amount).await?;
 
     if !check_escrow_balance(state, merchant_receives_usdc, "USDC").await? {
         return Err("Insufficient USDC balance in escrow wallet".into());
@@ -162,7 +162,7 @@ async fn process_usdc_settlement(
         INSERT INTO settlements 
         (id, payment_id, payment_token, settlement_token, amount_recieved, amount_settled,
          settlement_currency, recipient_wallet, merchant_id, status, provider, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'processing', 'zendfi_dex', $10)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'processing', 'solapay_dex', $10)
         "#,
         settlement_id,
         payment_id,
@@ -364,7 +364,7 @@ async fn execute_crypto_transfer(
             )?;
             instructions.push(transfer_ix);
 
-            let memo_data = format!("ZendFi settlement: {}", settlement_id);
+            let memo_data = format!("Solapay settlement: {}", settlement_id);
             let memo_ix = create_memo_instruction(&memo_data);
             instructions.push(memo_ix);
 
@@ -451,8 +451,8 @@ async fn check_escrow_balance(
 async fn calculate_settlement_amounts(
     amount: f64,
 ) -> Result<(f64, f64), Box<dyn std::error::Error + Send + Sync>> {
-    let zendfi_fee_rate = 0.029; // 2.9% fee
-    let fee = amount * zendfi_fee_rate;
+    let solapay_fee_rate = 0.029; // 2.9% fee
+    let fee = amount * solapay_fee_rate;
     let merchant_receives = amount - fee;
     Ok((merchant_receives, fee))
 }
