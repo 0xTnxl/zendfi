@@ -6,6 +6,7 @@ use bigdecimal::ToPrimitive;
 use crate::{AppState, models::PaymentStatus};
 use base64::Engine;
 use serde::{Serialize, Deserialize};
+use std::str::FromStr;
 
 pub const DEVNET_USDC_MINT: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
 pub const MAINNET_USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -504,15 +505,12 @@ pub async fn start_payment_monitor(state: AppState) {
 }
 
 pub fn validate_solana_address(address: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let decoded = bs58::decode(address).into_vec()
-        .map_err(|_| "Invalid base58 encoding")?;
+    let pubkey = solana_sdk::pubkey::Pubkey::from_str(address)
+        .map_err(|_| "Invalid Solana address format")?;
     
-    if decoded.len() != 32 {
-        return Err("Invalid Solana address length".into());
-    }
-
-    if address == "11111111111111111111111111111112" {
-        return Err("Cannot use system program as recipient wallet".into());
+    // Allow system program but maybe warn for certain contexts
+    if pubkey == solana_sdk::system_program::id() {
+        tracing::warn!("Using system program address as recipient");
     }
     
     Ok(())
