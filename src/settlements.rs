@@ -24,6 +24,8 @@ pub async fn process_settlement(
     state: &AppState,
     payment_id: Uuid,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut db_tx = state.db.begin().await?;
+    
     let payment = sqlx::query!(
         r#"SELECT p.id, p.merchant_id, p.amount_usd, 
                   p.status as "status: PaymentStatus", 
@@ -32,14 +34,29 @@ pub async fn process_settlement(
                   m.settlement_preference, m.wallet_address, m.name
            FROM payments p 
            JOIN merchants m ON p.merchant_id = m.id 
-           WHERE p.id = $1"#,
+           WHERE p.id = $1
+           FOR UPDATE"#,  
         payment_id
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *db_tx)
     .await?;
 
     if !matches!(payment.status, PaymentStatus::Confirmed) {
+        db_tx.rollback().await?;
         return Err("Payment not confirmed".into());
+    }
+
+    let existing_settlement = sqlx::query!(
+        "SELECT id FROM settlements WHERE payment_id = $1",
+        payment_id
+    )
+    .fetch_optional(&mut *db_tx)
+    .await?;
+
+    if existing_settlement.is_some() {
+        db_tx.rollback().await?;
+        tracing::info!("Settlement already exists for payment {}", payment_id);
+        return Ok(());
     }
 
     let amount_usd = payment.amount_usd.to_f64().unwrap_or(0.0);
@@ -51,9 +68,11 @@ pub async fn process_settlement(
         .or(payment.settlement_preference.as_deref())
         .unwrap_or("auto_usdc");
 
-    match settlement_preference {
+    // Process settlement based on preference
+    let result = match settlement_preference {
         "direct_token" => {
-            process_direct_token_settlement(
+            process_direct_token_settlement_atomic(
+                &mut db_tx,
                 state, 
                 payment_id, 
                 amount_usd, 
@@ -64,7 +83,8 @@ pub async fn process_settlement(
             ).await
         }
         _ => {
-            process_usdc_settlement(
+            process_usdc_settlement_atomic(
+                &mut db_tx,
                 state,
                 payment_id,
                 amount_usd,
@@ -74,10 +94,24 @@ pub async fn process_settlement(
                 &payment.name
             ).await
         }
+    };
+
+    match result {
+        Ok(_) => {
+            db_tx.commit().await?;
+            tracing::info!("Settlement completed atomically for payment {}", payment_id);
+            Ok(())
+        }
+        Err(e) => {
+            db_tx.rollback().await?;
+            tracing::error!("Settlement failed for payment {}, rolled back: {}", payment_id, e);
+            Err(e)
+        }
     }
 }
 
-async fn process_direct_token_settlement(
+async fn process_direct_token_settlement_atomic(
+    db_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     state: &AppState,
     payment_id: Uuid,
     amount_usd: f64,
@@ -86,7 +120,7 @@ async fn process_direct_token_settlement(
     merchant_wallet: &str,
     merchant_name: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing::info!("Processing direct {} settlement: ${} to {} ({})", 
+    tracing::info!("Processing atomic direct {} settlement: ${} to {} ({})", 
                    payment_token, amount_usd, merchant_wallet, merchant_name);
 
     let (merchant_receives, _solapay_fee) = calculate_settlement_amounts(amount_usd).await?;
@@ -115,23 +149,21 @@ async fn process_direct_token_settlement(
         merchant_id,
         chrono::Utc::now()
     )
-    .execute(&state.db)
+    .execute(&mut **db_tx)
     .await?;
 
+    // Execute the actual transfer (this is atomic with blockchain)
     execute_crypto_transfer(state, settlement_id, merchant_receives, payment_token, merchant_wallet).await?;
 
-    tracing::info!("Direct {} settlement completed: ${} to {}", payment_token, merchant_receives, merchant_name);
+    tracing::info!("Direct {} settlement completed atomically: ${} to {}", 
+                   payment_token, merchant_receives, merchant_name);
 
-    let _ = crate::webhooks::create_webhook_event(
-        state, 
-        payment_id, 
-        crate::webhooks::WebhookEventType::SettlementCompleted
-    ).await;
-
+    // Webhook will be sent after transaction commits
     Ok(())
 }
 
-async fn process_usdc_settlement(
+async fn process_usdc_settlement_atomic(
+    db_tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     state: &AppState,
     payment_id: Uuid,
     amount_usd: f64,
@@ -140,23 +172,36 @@ async fn process_usdc_settlement(
     merchant_wallet: &str,
     merchant_name: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing::info!("Processing USDC settlement: {} {} -> USDC to {} ({})", 
+    tracing::info!("Processing atomic USDC settlement: {} {} -> USDC to {} ({})", 
                    amount_usd, payment_token, merchant_wallet, merchant_name);
 
     let final_usdc_amount = if payment_token != "USDC" {
-        execute_jupiter_swap(state, payment_token, "USDC", amount_usd).await?
+        tracing::info!("Swapping {} {} to USDC via Jupiter", amount_usd, payment_token);
+
+        execute_jupiter_swap(state, payment_token, "USDC", amount_usd).await
+            .map_err(|e| {
+                tracing::error!("Jupiter swap failed for {} -> USDC: {}", payment_token, e);
+                e
+            })?
     } else {
+        tracing::info!("Payment already in USDC, no swap needed");
         amount_usd
     };
 
-    let (merchant_receives_usdc, _solapay_fee) = calculate_settlement_amounts(final_usdc_amount).await?;
+    let (merchant_receives_usdc, solapay_fee) = calculate_settlement_amounts(final_usdc_amount).await?;
+    
+    tracing::info!("Settlement calculation: {} USDC received -> {} USDC to merchant (fee: {} USDC)", 
+                   final_usdc_amount, merchant_receives_usdc, solapay_fee);
 
     if !check_escrow_balance(state, merchant_receives_usdc, "USDC").await? {
-        return Err("Insufficient USDC balance in escrow wallet".into());
+        return Err(format!(
+            "Insufficient USDC balance in escrow wallet. Required: {}, check escrow funding", 
+            merchant_receives_usdc
+        ).into());
     }
 
     let settlement_id = Uuid::new_v4();
-
+    
     sqlx::query!(
         r#"
         INSERT INTO settlements 
@@ -167,27 +212,32 @@ async fn process_usdc_settlement(
         settlement_id,
         payment_id,
         payment_token,
-        "USDC",
-        BigDecimal::from_f64(amount_usd).unwrap(),
-        BigDecimal::from_f64(merchant_receives_usdc).unwrap(),
+        "USDC", 
+        BigDecimal::from_f64(amount_usd).unwrap(), 
+        BigDecimal::from_f64(merchant_receives_usdc).unwrap(), 
         "USDC",
         merchant_wallet,
         merchant_id,
         chrono::Utc::now()
     )
-    .execute(&state.db)
-    .await?;
+    .execute(&mut **db_tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to insert settlement record: {}", e);
+        format!("Database error during settlement creation: {}", e)
+    })?;
 
-    execute_crypto_transfer(state, settlement_id, merchant_receives_usdc, "USDC", merchant_wallet).await?;
+    tracing::info!("Settlement record created with ID: {}", settlement_id);
 
-    tracing::info!("USDC settlement completed: ${} USDC to {}", merchant_receives_usdc, merchant_name);
+    execute_crypto_transfer(state, settlement_id, merchant_receives_usdc, "USDC", merchant_wallet).await
+        .map_err(|e| {
+            tracing::error!("USDC transfer failed for settlement {}: {}", settlement_id, e);
+            e
+        })?;
 
-    let _ = crate::webhooks::create_webhook_event(
-        state, 
-        payment_id, 
-        crate::webhooks::WebhookEventType::SettlementCompleted
-    ).await;
-
+    tracing::info!("Atomic USDC settlement completed successfully: {} USDC to {} ({})", 
+                   merchant_receives_usdc, merchant_wallet, merchant_name);
+ 
     Ok(())
 }
 

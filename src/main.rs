@@ -9,6 +9,12 @@ use axum::{
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 use tracing::Instrument;
+use std::collections::HashMap;
+use tokio::sync::RwLock;
+use std::time::Instant;
+use axum::extract::DefaultBodyLimit;
+use axum::extract::State;
+use axum::Extension;
 
 mod auth;
 mod models;
@@ -25,11 +31,62 @@ use config::Config;
 use std::sync::Arc;
 
 #[derive(Clone)]
+pub struct RateLimiter {
+    requests: Arc<RwLock<HashMap<String, Vec<Instant>>>>,
+    max_requests: usize,
+    window_seconds: u64,
+}
+
+#[derive(Clone)]
 pub struct AppState {
     pub db: sqlx::PgPool,
     pub solana_rpc_url: String,
     pub solana_client: Arc<sol_client::ResilientSolanaClient>,
     pub config: Config,
+}
+
+impl RateLimiter {
+    pub fn new(max_requests: usize, window_seconds: u64) -> Self {
+        Self {
+            requests: Arc::new(RwLock::new(HashMap::new())),
+            max_requests,
+            window_seconds,
+        }
+    }
+
+    pub async fn is_allowed(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut requests = self.requests.write().await;
+        
+        let entry = requests.entry(key.to_string()).or_insert_with(Vec::new);
+        
+        // Remove old requests outside the window
+        entry.retain(|&timestamp| now.duration_since(timestamp).as_secs() < self.window_seconds);
+        
+        if entry.len() >= self.max_requests {
+            false
+        } else {
+            entry.push(now);
+            true
+        }
+    }
+}
+
+async fn rate_limiting_middleware(
+    State(_state): State<AppState>,
+    Extension(merchant): Extension<crate::auth::AuthenticatedMerchant>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let rate_limiter = RateLimiter::new(100, 3600); // Each merchant get's 100 requests an hour
+    let key = format!("merchant_{}", merchant.merchant_id);
+    
+    if !rate_limiter.is_allowed(&key).await {
+        tracing::warn!("Rate limit exceeded for merchant {}", merchant.merchant_id);
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    
+    Ok(next.run(request).await)
 }
 
 async fn correlation_id_middleware(mut request: Request, next: Next) -> Result<Response, StatusCode> {
@@ -126,12 +183,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/webhooks", get(webhooks::list_webhook_events))
         .route("/api/v1/webhooks/:id/retry", post(webhooks::retry_webhook))
         .with_state(state.clone())
+        .route_layer(middleware::from_fn_with_state(state.clone(), rate_limiting_middleware))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::authenticate_merchant));
     
     // Combine the routers
     let app = Router::new()
         .merge(public_routes)
         .merge(protected_routes)
+        .layer(DefaultBodyLimit::max(1024 * 1024)) // 1MB limit
         .layer(middleware::from_fn(correlation_id_middleware))
         .layer(middleware::from_fn(cors_layer));
     

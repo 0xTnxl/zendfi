@@ -12,6 +12,7 @@ use crate::auth::AuthenticatedMerchant;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
+use rand::RngCore;
     
 type HmacSha256 = Hmac<Sha256>;
 
@@ -86,6 +87,42 @@ pub fn verify_webhook_signature(payload: &str, signature: &str, secret: &str) ->
     signature.as_bytes().ct_eq(expected_signature.as_bytes()).into()
 }
 
+// Add proper webhook secret management
+async fn get_merchant_webhook_secret(
+    state: &AppState, 
+    merchant_id: Uuid
+) -> Result<String, Box<dyn std::error::Error>> {
+    // Try to get existing secret first
+    if let Ok(existing) = sqlx::query!(
+        "SELECT webhook_secret FROM merchants WHERE id = $1 AND webhook_secret IS NOT NULL",
+        merchant_id
+    )
+    .fetch_one(&state.db)
+    .await
+    {
+        if let Some(secret) = existing.webhook_secret {
+            return Ok(secret);
+        }
+    }
+    
+    // Generate new cryptographically secure secret
+    let mut secret_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut secret_bytes);
+    let webhook_secret = format!("whsec_{}", hex::encode(secret_bytes));
+    
+    // Store in database
+    sqlx::query!(
+        "UPDATE merchants SET webhook_secret = $1 WHERE id = $2",
+        webhook_secret,
+        merchant_id
+    )
+    .execute(&state.db)
+    .await?;
+    
+    tracing::info!("Generated new webhook secret for merchant {}", merchant_id);
+    Ok(webhook_secret)
+}
+
 pub async fn create_webhook_event(
     state: &AppState,
     payment_id: Uuid,
@@ -148,12 +185,20 @@ pub async fn create_webhook_event(
         metadata: payment.metadata,
     };
 
-    let payload = WebhookPayload {
+    // Get or generate proper webhook secret
+    let webhook_secret = get_merchant_webhook_secret(state, payment.merchant_id).await?;
+    
+    let mut payload = WebhookPayload {
         event: event_type.clone(),
         payment: webhook_data,
         timestamp: Utc::now(),
         signature: String::new(),
     };
+
+    // Generate signature with proper secret
+    let payload_json = serde_json::to_string(&payload)?;
+    let signature = generate_webhook_signature(&payload_json, &webhook_secret);
+    payload.signature = signature;
 
     let webhook_id = Uuid::new_v4();
     sqlx::query!(
@@ -180,8 +225,6 @@ pub async fn create_webhook_event(
 
     Ok(())
 }
-
-
 
 async fn get_webhook_event(state: &AppState, webhook_id: Uuid) -> Result<WebhookEvent, sqlx::Error> {
     sqlx::query_as!(
@@ -232,7 +275,16 @@ pub async fn deliver_webhook(state: AppState, webhook_id: Uuid) {
     }
 
     let payload_json = serde_json::to_string(&webhook.payload).unwrap();
-    let merchant_secret = format!("webhook_secret_{}", webhook.merchant_id);
+    
+    // Use proper merchant webhook secret instead of predictable format
+    let merchant_secret = match get_merchant_webhook_secret(&state, webhook.merchant_id).await {
+        Ok(secret) => secret,
+        Err(e) => {
+            tracing::error!("Failed to get webhook secret for merchant {}: {}", webhook.merchant_id, e);
+            return;
+        }
+    };
+    
     let signature = generate_webhook_signature(&payload_json, &merchant_secret);
 
     let mut payload: WebhookPayload = serde_json::from_value(webhook.payload).unwrap();

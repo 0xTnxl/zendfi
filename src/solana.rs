@@ -302,6 +302,30 @@ fn check_transaction_for_payment_reference(
     network: &str,
     expected_token: SupportedToken,
 ) -> bool {
+    let amount_verified = match expected_token {
+        SupportedToken::Sol => {
+            check_sol_balance_changes(transaction, expected_amount, payment_reference)
+        }
+        SupportedToken::Usdc | SupportedToken::Usdt => {
+            let mint_address = expected_token.get_mint_address(network).unwrap();
+            check_spl_token_changes(transaction, expected_amount, mint_address, payment_reference)
+        }
+    };
+
+    if !amount_verified {
+        return false;
+    }
+
+    let reference_verified = check_payment_reference_in_transaction(transaction, payment_reference);
+    
+    if !reference_verified {
+        tracing::warn!("Transaction amount matches but missing payment reference {}", payment_reference);
+    }
+
+    amount_verified
+}
+
+fn check_payment_reference_in_transaction(transaction: &Value, payment_reference: &str) -> bool {
     if let Some(result) = transaction.get("result") {
         if result.is_null() {
             return false;
@@ -312,62 +336,78 @@ fn check_transaction_for_payment_reference(
             if let Some(log_messages) = meta["logMessages"].as_array() {
                 for log in log_messages {
                     if let Some(log_str) = log.as_str() {
-                        if log_str.contains(payment_reference) {
+                        if log_str.to_lowercase().contains(&payment_reference.to_lowercase()) {
                             tracing::info!("Found payment reference {} in transaction logs", payment_reference);
-                            return true; 
+                            return true;
                         }
                     }
                 }
             }
         }
 
-        // Check instruction data for payment reference
+        // Check instruction data for payment reference  
         if let Some(transaction_obj) = result["transaction"].as_object() {
             if let Some(message) = transaction_obj["message"].as_object() {
                 if let Some(instructions) = message["instructions"].as_array() {
                     for instruction in instructions {
-                        if let Some(data) = instruction["data"].as_str() {
-                            if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(data) {
-                                if let Ok(decoded_str) = String::from_utf8(decoded) {
-                                    if decoded_str.contains(payment_reference) {
-                                        tracing::info!("Found payment reference {} in instruction data", payment_reference);
-                                        return true; 
-                                    }
-                                }
-                            }
+                        if check_instruction_for_reference(instruction, payment_reference) {
+                            return true;
                         }
                     }
                 }
             }
         }
-
-        match expected_token {
-            SupportedToken::Sol => {
-                check_sol_balance_changes(transaction, expected_amount, payment_reference)
-            }
-            SupportedToken::Usdc | SupportedToken::Usdt => {
-                let mint_address = expected_token.get_mint_address(network).unwrap();
-                check_spl_token_changes(transaction, expected_amount, mint_address, payment_reference)
-            }
-        }
-    } else {
-        false
     }
+
+    false
 }
 
+fn check_instruction_for_reference(instruction: &Value, payment_reference: &str) -> bool {
+    // Check instruction data
+    if let Some(data) = instruction["data"].as_str() {
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(data) {
+            if let Ok(decoded_str) = String::from_utf8(decoded) {
+                if decoded_str.to_lowercase().contains(&payment_reference.to_lowercase()) {
+                    tracing::info!("Found payment reference {} in instruction data", payment_reference);
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Check if instruction is a memo instruction
+    if let Some(program_id) = instruction["programId"].as_str() {
+        if program_id == "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr" {
+            // This is a memo instruction, check for our reference
+            if let Some(data) = instruction["data"].as_str() {
+                if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(data) {
+                    if let Ok(memo_text) = String::from_utf8(decoded) {
+                        if memo_text.to_lowercase().contains(&payment_reference.to_lowercase()) {
+                            tracing::info!("Found payment reference {} in memo instruction", payment_reference);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
 
 fn check_spl_token_changes(
     transaction: &Value,
     expected_amount: f64,
     mint_address: &str,
-    _payment_reference: &str,
+    payment_reference: &str,
 ) -> bool {
     if let Some(meta) = transaction["result"]["meta"].as_object() {
         if let Some(pre_token_balances) = meta["preTokenBalances"].as_array() {
             if let Some(post_token_balances) = meta["postTokenBalances"].as_array() {
+                
+                // Look for recipient wallet increases
                 for (pre_idx, pre_balance) in pre_token_balances.iter().enumerate() {
                     if let Some(post_balance) = post_token_balances.get(pre_idx) {
-                        // Check if this is the expected token transfer
                         if let (Some(pre_mint), Some(post_mint)) = (
                             pre_balance["mint"].as_str(),
                             post_balance["mint"].as_str()
@@ -377,13 +417,25 @@ fn check_spl_token_changes(
                                     pre_balance["uiTokenAmount"]["uiAmount"].as_f64(),
                                     post_balance["uiTokenAmount"]["uiAmount"].as_f64()
                                 ) {
-                                    let transferred = (post_amount - pre_amount).abs();
-                                    let tolerance = expected_amount * 0.05; // 5% tolerance
-
-                                    if (transferred - expected_amount).abs() <= tolerance {
-                                        tracing::info!("Found {} transfer of {} (expected {}, tolerance {})", 
-                                                      mint_address, transferred, expected_amount, tolerance);
-                                        return true;
+                                    let transferred = post_amount - pre_amount;
+                                    
+                                    // Only accept positive transfers (receiving tokens)
+                                    if transferred > 0.0 {
+                                        // Use stricter tolerance: 2% instead of 5%
+                                        let tolerance = expected_amount * 0.02;
+                                        
+                                        if (transferred - expected_amount).abs() <= tolerance {
+                                            tracing::info!(
+                                                "Verified {} token transfer: {} (expected {}, tolerance {}, ref: {})", 
+                                                mint_address, transferred, expected_amount, tolerance, payment_reference
+                                            );
+                                            return true;
+                                        } else {
+                                            tracing::warn!(
+                                                "Token amount mismatch: got {} expected {} (difference: {}, tolerance: {})",
+                                                transferred, expected_amount, (transferred - expected_amount).abs(), tolerance
+                                            );
+                                        }
                                     }
                                 }
                             }
