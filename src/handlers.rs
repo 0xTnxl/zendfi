@@ -16,6 +16,7 @@ use bigdecimal::ToPrimitive;
 use bip39::{Mnemonic, Language};
 use ed25519_dalek::Signer;
 use tracing::instrument;
+use axum::response::Json as AxumJson;
 
 fn validate_payment_amount(amount: f64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if amount <= 0.0 {
@@ -51,32 +52,52 @@ pub async fn create_payment(
     State(state): State<AppState>,
     Extension(merchant): Extension<AuthenticatedMerchant>,
     Json(request): Json<CreatePaymentRequest>,
-) -> Result<Json<PaymentResponse>, StatusCode> {
+) -> Result<Json<PaymentResponse>, (StatusCode, AxumJson<serde_json::Value>)> { 
     tracing::info!("Creating payment for ${} {}", request.amount, request.currency);
 
-    validate_payment_amount(request.amount)
-        .map_err(|e| {
-            tracing::warn!("Invalid payment amount: {}", e);
-            StatusCode::BAD_REQUEST
-        })?;
-    
-    if request.amount <= 0.0 || request.amount > 1_000_000.0 {
-        return Err(StatusCode::BAD_REQUEST);
+    if let Err(e) = validate_payment_amount(request.amount) {
+        let error_response = serde_json::json!({
+            "error": {
+                "message": format!("Invalid payment amount: {}", e),
+                "field": "amount",
+                "value": request.amount
+            }
+        });
+        return Err((StatusCode::BAD_REQUEST, AxumJson(error_response)));
     }
 
     if request.currency != "USD" {
-        tracing::warn!("Unsupported currency: {}", request.currency);
-        return Err(StatusCode::BAD_REQUEST);
+        let error_response = serde_json::json!({
+            "error": {
+                "message": "Only USD currency is supported",
+                "field": "currency",
+                "supported_values": ["USD"]
+            }
+        });
+        return Err((StatusCode::BAD_REQUEST, AxumJson(error_response)));
     }
 
-    if !check_merchant_limits(&state, merchant.merchant_id, request.amount).await
-        .map_err(|e| {
-            tracing::error!("Error checking merchant limits: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-    {
-        tracing::warn!("Merchant {} exceeded payment limits", merchant.merchant_id);
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+    // Fix merchant limits check
+    let limits_check = check_merchant_limits(&state, merchant.merchant_id, request.amount).await
+        .map_err(|_| {
+            let error_response = serde_json::json!({
+                "error": {
+                    "message": "Failed to check merchant limits",
+                    "type": "internal_error"
+                }
+            });
+            (StatusCode::INTERNAL_SERVER_ERROR, AxumJson(error_response))
+        })?;
+
+    if !limits_check {
+        let error_response = serde_json::json!({
+            "error": {
+                "message": "Payment limits exceeded",
+                "details": "You have exceeded your daily volume, payment amount, or rate limits",
+                "contact": "Contact support to increase your limits"
+            }
+        });
+        return Err((StatusCode::TOO_MANY_REQUESTS, AxumJson(error_response)));
     }
 
     let token = match request.token.as_deref() {
@@ -86,8 +107,14 @@ pub async fn create_payment(
     };
 
     if token.get_mint_address(&state.config.solana_network).is_none() && !matches!(token, crate::solana::SupportedToken::Sol) {
-        tracing::warn!("Unsupported token for network: {:?} on {}", token, state.config.solana_network);
-        return Err(StatusCode::BAD_REQUEST);
+        let error_response = serde_json::json!({
+            "error": {
+                "message": "Unsupported token for network",
+                "field": "token",
+                "value": request.token
+            }
+        });
+        return Err((StatusCode::BAD_REQUEST, AxumJson(error_response)));
     }
 
     let amount_usd = request.amount;
@@ -96,24 +123,37 @@ pub async fn create_payment(
     let amount_usd_bd = BigDecimal::from_f64(amount_usd).unwrap();
     let token_string = format!("{:?}", token).to_uppercase();
     
-    let qr_code = crate::solana::generate_payment_qr(
+    let qr_code = match crate::solana::generate_payment_qr(
         &payment_id,
         amount_usd,
         &state.config.recipient_wallet,
         &state.config.solana_network,
         token.clone()
-    ).await.map_err(|e| {
-        tracing::error!("Failed to generate QR code: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    ).await {
+        Ok(qr) => qr,
+        Err(e) => {
+            let error_response = serde_json::json!({
+                "error": {
+                    "message": format!("Failed to generate QR code: {}", e)
+                }
+            });
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, AxumJson(error_response)));
+        }
+    };
 
-    let mut tx = state.db.begin().await
-        .map_err(|e| {
-            tracing::error!("Failed to begin transaction: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            let error_response = serde_json::json!({
+                "error": {
+                    "message": format!("Failed to begin transaction: {}", e)
+                }
+            });
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, AxumJson(error_response)));
+        }
+    };
     
-    sqlx::query!(
+    if let Err(e) = sqlx::query!(
         r#"
         INSERT INTO payments (id, merchant_id, amount_usd, status, metadata, 
                              payment_token, settlement_preference_override, created_at, expires_at)
@@ -130,14 +170,17 @@ pub async fn create_payment(
         expires_at
     )
     .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to create payment: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    .await {
+        let error_response = serde_json::json!({
+            "error": {
+                "message": format!("Failed to create payment: {}", e)
+            }
+        });
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, AxumJson(error_response)));
+    }
 
     // Audit log with correlation ID
-    sqlx::query!(
+    if let Err(e) = sqlx::query!(
         r#"
         INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by)
         VALUES ('payments', $1, 'INSERT', $2, $3)
@@ -151,17 +194,23 @@ pub async fn create_payment(
         merchant.merchant_id
     )
     .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to insert audit log: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    .await {
+        let error_response = serde_json::json!({
+            "error": {
+                "message": format!("Failed to insert audit log: {}", e)
+            }
+        });
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, AxumJson(error_response)));
+    }
 
-    tx.commit().await
-        .map_err(|e| {
-            tracing::error!("Failed to commit transaction: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    if let Err(e) = tx.commit().await {
+        let error_response = serde_json::json!({
+            "error": {
+                "message": format!("Failed to commit transaction: {}", e)
+            }
+        });
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, AxumJson(error_response)));
+    }
 
     // Create webhook event (non-blocking)
     if let Err(e) = crate::webhooks::create_webhook_event(&state, payment_id, crate::webhooks::WebhookEventType::PaymentCreated).await {

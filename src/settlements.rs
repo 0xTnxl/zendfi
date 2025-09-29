@@ -365,15 +365,28 @@ async fn execute_crypto_transfer(
     
     let keypair_bytes = fs::read(keypair_path)
         .map_err(|e| format!("Failed to read keypair file {}: {}", keypair_path, e))?;
-        
-    if keypair_bytes.len() != 64 {
-        return Err(format!("Invalid keypair file size: expected 64 bytes, got {}", keypair_bytes.len()).into());
-    }
 
-    let mut keypair_array = [0u8; 64];
-    keypair_array.copy_from_slice(&keypair_bytes);
-    let escrow_keypair = solana_sdk::signature::keypair::Keypair::try_from(&keypair_array[..])
-        .map_err(|e| format!("Failed to parse keypair: {}", e))?;
+    let escrow_keypair = if keypair_bytes.len() == 64 {
+        let mut keypair_array = [0u8; 64];
+        keypair_array.copy_from_slice(&keypair_bytes);
+        Keypair::try_from(&keypair_array[..])
+            .map_err(|e| format!("Failed to parse 64-byte keypair: {}", e))?
+    } else if keypair_bytes.len() == 32 {
+        Keypair::try_from(&keypair_bytes[..])
+            .map_err(|e| format!("Failed to parse 32-byte seed: {}", e))?
+    } else {
+        let key_data: Vec<u8> = serde_json::from_slice(&keypair_bytes)
+            .map_err(|e| format!("Invalid keypair format (not 32, 64 bytes, or JSON): {} bytes, error: {}", keypair_bytes.len(), e))?;
+            
+        if key_data.len() == 64 {
+            let mut keypair_array = [0u8; 64];
+            keypair_array.copy_from_slice(&key_data);
+            Keypair::try_from(&keypair_array[..])
+                .map_err(|e| format!("Failed to parse JSON keypair: {}", e))?
+        } else {
+            return Err(format!("JSON keypair has invalid length: {} (expected 64)", key_data.len()).into());
+        }
+    };
 
     let rpc_client = RpcClient::new(&state.solana_rpc_url);
     let recipient_pubkey = Pubkey::from_str(recipient_wallet)

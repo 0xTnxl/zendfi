@@ -12,9 +12,9 @@ use tracing::Instrument;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use std::time::Instant;
-use axum::extract::DefaultBodyLimit;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::Extension;
+use axum::response::{Json as AxumJson, IntoResponse};
 
 mod auth;
 mod models;
@@ -70,6 +70,36 @@ impl RateLimiter {
             true
         }
     }
+}
+
+async fn error_handler_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
+    let result = next.run(request).await;
+
+    if result.status().is_client_error() || result.status().is_server_error() {
+        let status = result.status();
+        let error_message = match status {
+            StatusCode::BAD_REQUEST => "Bad request - check your input parameters",
+            StatusCode::UNAUTHORIZED => "Unauthorized - invalid or missing API key",
+            StatusCode::NOT_FOUND => "Resource not found",
+            StatusCode::TOO_MANY_REQUESTS => "Rate limit exceeded - slow down your requests",
+            StatusCode::INTERNAL_SERVER_ERROR => "Internal server error - please try again",
+            _ => "An error occurred"
+        };
+        
+        let error_json = serde_json::json!({
+            "error": {
+                "code": status.as_u16(),
+                "message": error_message,
+                "timestamp": chrono::Utc::now()
+            }
+        });
+        
+        let mut response = AxumJson(error_json).into_response();
+        *response.status_mut() = status;
+        return Ok(response);
+    }
+    
+    Ok(result)
 }
 
 async fn rate_limiting_middleware(
@@ -190,7 +220,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .merge(public_routes)
         .merge(protected_routes)
-        .layer(DefaultBodyLimit::max(1024 * 1024)) // 1MB limit
+        .layer(DefaultBodyLimit::max(1024 * 1024))
+        .layer(middleware::from_fn(error_handler_middleware))
         .layer(middleware::from_fn(correlation_id_middleware))
         .layer(middleware::from_fn(cors_layer));
     
