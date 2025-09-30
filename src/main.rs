@@ -15,6 +15,10 @@ use std::time::Instant;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::Extension;
 use axum::response::{Json as AxumJson, IntoResponse};
+use crate::rate_limiter::PersistentRateLimiter;
+use axum::http::HeaderValue;
+use std::net::SocketAddr;
+use axum::extract::ConnectInfo;
 
 mod auth;
 mod models;
@@ -22,6 +26,7 @@ mod handlers;
 mod solana;
 mod sol_client;
 mod settlements;
+mod rate_limiter;
 mod database;
 mod config;
 mod webhooks;
@@ -131,19 +136,109 @@ async fn error_handler_middleware(
 
 
 async fn rate_limiting_middleware(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(merchant): Extension<crate::auth::AuthenticatedMerchant>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let (max_requests, window_seconds, rate_limit_key) = match request.uri().path() {
+        path if path.starts_with("/api/v1/payments") => {
+            (50, 3600, format!("payments_merchant_{}", merchant.merchant_id))
+        }
+        path if path.starts_with("/api/v1/dashboard") => {
+            (200, 3600, format!("dashboard_merchant_{}", merchant.merchant_id))
+        }
+        _ => {
+            (100, 3600, format!("api_merchant_{}", merchant.merchant_id))
+        }
+    };
+
+    let rate_limiter = PersistentRateLimiter::new(max_requests, window_seconds);
+    
+    let rate_limit_result = rate_limiter
+        .check_rate_limit(&state, &rate_limit_key, Some(merchant.api_key_id))
+        .await
+        .map_err(|e| {
+            tracing::error!("Rate limiter error: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if !rate_limit_result.allowed {
+        tracing::warn!(
+            "Rate limit exceeded for merchant {} (key: {})", 
+            merchant.merchant_id, 
+            rate_limit_key
+        );
+
+        let response = axum::response::Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("X-RateLimit-Limit", max_requests.to_string())
+            .header("X-RateLimit-Remaining", "0")
+            .header("X-RateLimit-Reset", rate_limit_result.reset_time.to_string())
+            .header("Retry-After", rate_limit_result.retry_after.unwrap_or(60).to_string())
+            .body(axum::body::Body::from(serde_json::json!({
+                "error": {
+                    "code": 429,
+                    "message": "Rate limit exceeded",
+                    "limit": max_requests,
+                    "window_seconds": window_seconds,
+                    "reset_time": rate_limit_result.reset_time,
+                    "retry_after": rate_limit_result.retry_after
+                }
+            }).to_string()))
+            .unwrap();
+
+        return Ok(response);
+    }
+
+    request.extensions_mut().insert(rate_limit_result.clone());
+
+    let response = next.run(request).await; 
+
+    let mut response = response;
+    response.headers_mut().insert(
+        "X-RateLimit-Limit", 
+        HeaderValue::from_str(&max_requests.to_string()).unwrap()
+    );
+    response.headers_mut().insert(
+        "X-RateLimit-Remaining", 
+        HeaderValue::from_str(&rate_limit_result.remaining.to_string()).unwrap()
+    );
+    response.headers_mut().insert(
+        "X-RateLimit-Reset", 
+        HeaderValue::from_str(&rate_limit_result.reset_time.to_string()).unwrap()
+    );
+
+    Ok(response)
+}
+
+async fn public_rate_limiting_middleware(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let rate_limiter = RateLimiter::new(100, 3600); // Each merchant get's 100 requests an hour
-    let key = format!("merchant_{}", merchant.merchant_id);
-    
-    if !rate_limiter.is_allowed(&key).await {
-        tracing::warn!("Rate limit exceeded for merchant {}", merchant.merchant_id);
+    let state = request.extensions().get::<AppState>().unwrap().clone();
+
+    let ip_hash = {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(addr.ip().to_string().as_bytes());
+        hex::encode(hasher.finalize())[..16].to_string() 
+    };
+
+    let rate_limit_key = format!("public_ip_{}", ip_hash);
+    let rate_limiter = PersistentRateLimiter::new(10, 3600); 
+
+    let rate_limit_result = rate_limiter
+        .check_rate_limit(&state, &rate_limit_key, None)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !rate_limit_result.allowed {
+        tracing::warn!("Public rate limit exceeded for IP: {}", addr.ip());
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-    
+
     Ok(next.run(request).await)
 }
 
@@ -197,6 +292,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let solana_client = Arc::new(sol_client::ResilientSolanaClient::new(
         config.solana_rpc_urls.clone()
     ));
+
+    let state = AppState {
+        db: db.clone(),
+        solana_rpc_url: config.solana_rpc_urls.first()
+            .unwrap_or(&"https://api.devnet.solana.com".to_string())
+            .clone(),
+        solana_client: solana_client.clone(),
+        config: config.clone(),
+    };
+
+    let cleanup_state = state.clone();
+    tokio::spawn(rate_limiter::start_rate_limit_cleanup_worker(cleanup_state));
     
     let monitor_client = solana_client.clone();
     tokio::spawn(sol_client::start_endpoint_monitor(monitor_client));
@@ -230,6 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/system/health", get(system_health))
         .route("/", get(root_handler))
         .route("/api/v1/merchants", post(create_merchant))
+        .route_layer(middleware::from_fn(public_rate_limiting_middleware)) 
         .with_state(state.clone());
 
     let protected_routes = Router::new()
