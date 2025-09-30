@@ -7,12 +7,13 @@ use axum::{
 use uuid::Uuid;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use argon2::password_hash::{rand_core::OsRng, SaltString};
+use sha2::{Sha256, Digest};
 use crate::AppState;
+use rand::RngCore;
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedMerchant {
     pub merchant_id: Uuid,
-    #[allow(dead_code)]
     pub api_key_id: Uuid,
 }
 
@@ -37,43 +38,67 @@ pub async fn authenticate_merchant(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let key_prefix = api_key.chars().take(12).collect::<String>();
-    let api_key_records = sqlx::query!(
+    // Create a cryptographic hash of the entire API key
+    let mut hasher = Sha256::new();
+    hasher.update(api_key.as_bytes());
+    let key_hash = hex::encode(hasher.finalize());
+
+    // Look up by full hash - NO PREFIX LOOKUP
+    let api_key_record = sqlx::query!(
         r#"
-        SELECT id, merchant_id, key_hash, is_active, last_used_at, created_at
+        SELECT id, merchant_id, argon2_hash, is_active, last_used_at, created_at
         FROM api_keys 
-        WHERE key_prefix = $1 AND is_active = true
+        WHERE sha256_hash = $1 AND is_active = true
         "#,
-        key_prefix
+        key_hash
     )
-    .fetch_all(&state.db)
+    .fetch_optional(&state.db)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|e| {
+        tracing::error!("Database error during authentication: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let record = api_key_record.ok_or_else(|| {
+        tracing::warn!("Invalid API key attempted");
+        StatusCode::UNAUTHORIZED
+    })?;
+
+    // Double verification with Argon2 (defense in depth)
+    let hash_str = record.argon2_hash
+        .as_ref()
+        .ok_or_else(|| {
+            tracing::error!("Missing Argon2 hash in database for key {}", record.id);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let parsed_hash = PasswordHash::new(hash_str)
+        .map_err(|_| {
+            tracing::error!("Invalid Argon2 hash format in database for key {}", record.id);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let argon2 = Argon2::default();
-    let mut authenticated_record = None;
-
-    for record in api_key_records {
-        if let Ok(parsed_hash) = PasswordHash::new(&record.key_hash) {
-            if argon2.verify_password(api_key.as_bytes(), &parsed_hash).is_ok() {
-                authenticated_record = Some(record);
-                break;
-            }
-        }
+    if argon2.verify_password(api_key.as_bytes(), &parsed_hash).is_err() {
+        tracing::warn!("API key failed Argon2 verification");
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let api_key_record = authenticated_record.ok_or(StatusCode::UNAUTHORIZED)?;
-
-    let _ = sqlx::query!(
-        "UPDATE api_keys SET last_used_at = NOW() WHERE id = $1",
-        api_key_record.id
-    )
-    .execute(&state.db)
-    .await;
+    // Update last used timestamp (non-blocking)
+    let db_clone = state.db.clone();
+    let key_id = record.id;
+    tokio::spawn(async move {
+        let _ = sqlx::query!(
+            "UPDATE api_keys SET last_used_at = NOW() WHERE id = $1",
+            key_id
+        )
+        .execute(&db_clone)
+        .await;
+    });
 
     let authenticated_merchant = AuthenticatedMerchant {
-        merchant_id: api_key_record.merchant_id,
-        api_key_id: api_key_record.id,
+        merchant_id: record.merchant_id,
+        api_key_id: record.id,
     };
     
     request.extensions_mut().insert(authenticated_merchant);
@@ -85,41 +110,52 @@ pub async fn generate_api_key_string(
     state: &AppState, 
     merchant_id: Uuid
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let key_bytes: [u8; 32] = rand::random();
+    let mut key_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut key_bytes);
     let api_key = format!("zfi_live_{}", hex::encode(key_bytes));
+
+    let mut hasher = Sha256::new();
+    hasher.update(api_key.as_bytes());
+    let sha256_hash = hex::encode(hasher.finalize());
 
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
-    let key_hash = argon2.hash_password(api_key.as_bytes(), &salt)
-        .map_err(|e| format!("Password hashing failed: {}", e))?; 
-    
-    let key_prefix = api_key.chars().take(12).collect::<String>();
-    
+    let argon2_hash = argon2.hash_password(api_key.as_bytes(), &salt)
+        .map_err(|e| format!("Argon2 hashing failed: {}", e))?; 
+
     sqlx::query!(
         r#"
-        INSERT INTO api_keys (id, merchant_id, key_hash, key_prefix, is_active, created_at)
+        INSERT INTO api_keys (id, merchant_id, sha256_hash, argon2_hash, is_active, created_at)
         VALUES ($1, $2, $3, $4, $5, $6)
         "#,
         Uuid::new_v4(),
         merchant_id,
-        key_hash.to_string(),
-        key_prefix,
+        sha256_hash,
+        argon2_hash.to_string(),
         true,
         chrono::Utc::now()
     )
     .execute(&state.db)
     .await?;
     
+    tracing::info!("Generated secure API key for merchant {}", merchant_id);
     Ok(api_key)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    
     #[test]
     fn test_api_key_format() {
         let key_bytes: [u8; 32] = [1; 32];
         let api_key = format!("zfi_live_{}", hex::encode(key_bytes));
         assert!(api_key.starts_with("zfi_live_"));
         assert_eq!(api_key.len(), 73); // "zfi_live_" (9) + 64 hex chars
+
+        let mut hasher = Sha256::new();
+        hasher.update(api_key.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+        assert_eq!(hash.len(), 64); // SHA256 produces 64 hex chars
     }
 }

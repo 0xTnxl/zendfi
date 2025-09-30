@@ -47,13 +47,14 @@ fn validate_merchant_data(request: &CreateMerchantRequest) -> Result<(), Box<dyn
     Ok(())
 }
 
-#[instrument(skip(state), fields(merchant_id = %merchant.merchant_id))]
+#[instrument(skip(state), fields(merchant_id = %merchant.merchant_id, api_key_id = %merchant.api_key_id))]
 pub async fn create_payment(
     State(state): State<AppState>,
     Extension(merchant): Extension<AuthenticatedMerchant>,
     Json(request): Json<CreatePaymentRequest>,
-) -> Result<Json<PaymentResponse>, (StatusCode, AxumJson<serde_json::Value>)> { 
-    tracing::info!("Creating payment for ${} {}", request.amount, request.currency);
+) -> Result<Json<PaymentResponse>, (StatusCode, AxumJson<serde_json::Value>)> {
+    tracing::info!("Creating payment for ${} {} using API key {}", 
+                   request.amount, request.currency, merchant.api_key_id);
 
     if let Err(e) = validate_payment_amount(request.amount) {
         let error_response = serde_json::json!({
