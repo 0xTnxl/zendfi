@@ -899,3 +899,42 @@ pub async fn health_check() -> Json<serde_json::Value> {
         "version": "0.1.0"
     }))
 }
+
+pub async fn get_rate_limit_status(
+    State(state): State<AppState>,
+    Extension(merchant): Extension<AuthenticatedMerchant>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let rate_limiter = crate::rate_limiter::PersistentRateLimiter::new(100, 3600);
+    let key = format!("api_merchant_{}", merchant.merchant_id);
+    
+    let current_usage = rate_limiter
+        .get_current_usage(&state, &key)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "merchant_id": merchant.merchant_id,
+        "current_usage": current_usage,
+        "limit": 100,
+        "window_seconds": 3600,
+        "remaining": (100 - current_usage).max(0)
+    })))
+}
+
+pub async fn reset_merchant_rate_limit(
+    State(state): State<AppState>,
+    Path(merchant_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let rate_limiter = crate::rate_limiter::PersistentRateLimiter::new(100, 3600);
+    let key = format!("api_merchant_{}", merchant_id);
+    
+    rate_limiter
+        .reset_rate_limit(&state, &key)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "message": "Rate limit reset successfully",
+        "merchant_id": merchant_id
+    })))
+}
