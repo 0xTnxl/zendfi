@@ -72,35 +72,63 @@ impl RateLimiter {
     }
 }
 
-async fn error_handler_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
+
+async fn error_handler_middleware(
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let correlation_id = request
+        .headers()
+        .get("x-correlation-id")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
     let result = next.run(request).await;
 
     if result.status().is_client_error() || result.status().is_server_error() {
         let status = result.status();
+
+        tracing::error!(
+            "Request failed with status {}: {} {}",
+            status,
+            method,
+            uri
+        );
+
         let error_message = match status {
             StatusCode::BAD_REQUEST => "Bad request - check your input parameters",
             StatusCode::UNAUTHORIZED => "Unauthorized - invalid or missing API key",
             StatusCode::NOT_FOUND => "Resource not found",
             StatusCode::TOO_MANY_REQUESTS => "Rate limit exceeded - slow down your requests",
             StatusCode::INTERNAL_SERVER_ERROR => "Internal server error - please try again",
-            _ => "An error occurred"
+            _ => "An error occurred",
         };
-        
+
+        let detailed_error = if std::env::var("ENVIRONMENT").unwrap_or_default() == "development" {
+            format!("{} (check server logs for details)", error_message)
+        } else {
+            error_message.to_string()
+        };
+
         let error_json = serde_json::json!({
             "error": {
                 "code": status.as_u16(),
-                "message": error_message,
-                "timestamp": chrono::Utc::now()
+                "message": detailed_error,
+                "timestamp": chrono::Utc::now(),
+                "request_id": correlation_id,
             }
         });
-        
+
         let mut response = AxumJson(error_json).into_response();
         *response.status_mut() = status;
         return Ok(response);
     }
-    
+
     Ok(result)
 }
+
 
 async fn rate_limiting_middleware(
     State(_state): State<AppState>,

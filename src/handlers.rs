@@ -378,13 +378,13 @@ pub async fn create_merchant(
 
     validate_merchant_data(&request)
         .map_err(|e| {
-            tracing::warn!("Invalid merchant data: {}", e);
+            tracing::error!("Validation failed: {}", e);
             StatusCode::BAD_REQUEST
         })?;
 
     if let Some(ref webhook_url) = request.webhook_url {
         if !is_valid_webhook_url(webhook_url).await {
-            tracing::warn!("Invalid webhook URL provided: {}", webhook_url);
+            tracing::error!("Invalid webhook URL: {}", webhook_url);
             return Err(StatusCode::BAD_REQUEST);
         }
     }
@@ -405,7 +405,7 @@ pub async fn create_merchant(
 
         match method {
             "mnemonic" => {
-                let wallet_pubkey = generate_merchant_wallet_from_mnemonic(&merchant_id, &state).await
+                let wallet_pubkey = generate_merchant_wallet_from_mnemonic(&merchant_id).await
                     .map_err(|e| {
                         tracing::error!("Failed to generate mnemonic wallet: {}", e);
                         StatusCode::INTERNAL_SERVER_ERROR
@@ -413,7 +413,7 @@ pub async fn create_merchant(
                 (wallet_pubkey, true, "mnemonic".to_string())
             }
             _ => {
-                let wallet_pubkey = generate_simple_merchant_wallet(&merchant_id, &state).await
+                let wallet_pubkey = generate_simple_merchant_wallet(&merchant_id).await
                     .map_err(|e| {
                         tracing::error!("Failed to generate simple wallet: {}", e);
                         StatusCode::INTERNAL_SERVER_ERROR
@@ -453,6 +453,23 @@ pub async fn create_merchant(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    if wallet_generated {
+        let merchant_index = get_merchant_derivation_index(&merchant_id, &state).await
+            .map_err(|e| {
+                tracing::error!("Failed to get derivation index: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        let derivation_path = match generation_method.as_str() {
+            "mnemonic" => format!("m/44'/501'/{}'", merchant_index),
+            _ => "simple".to_string(),
+        };
+
+        if let Err(e) = store_wallet_metadata(&merchant_id, &merchant_wallet, merchant_index, &derivation_path, &state).await {
+            tracing::error!("Failed to store wallet metadata: {}", e);
+        }
+    }
+
     let api_key = crate::auth::generate_api_key_string(&state, merchant_id).await
         .map_err(|e| {
             tracing::error!("Failed to generate API key: {}", e);
@@ -488,7 +505,6 @@ pub async fn create_merchant(
 
 async fn generate_simple_merchant_wallet(
     merchant_id: &Uuid,
-    state: &AppState,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let master_secret = std::env::var("SOLAPAY_MASTER_SEED")
         .map_err(|_| "SOLAPAY_MASTER_SEED environment variable is required for security")?;
@@ -506,8 +522,6 @@ async fn generate_simple_merchant_wallet(
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed_bytes);
     let verifying_key = signing_key.verifying_key();
     let public_key = bs58::encode(verifying_key.to_bytes()).into_string();
-
-    store_wallet_metadata(merchant_id, &public_key, 0, "simple", state).await?;
     
     tracing::info!("Generated wallet {} for merchant {}", public_key, merchant_id);
     
@@ -516,7 +530,6 @@ async fn generate_simple_merchant_wallet(
 
 async fn generate_merchant_wallet_from_mnemonic(
     merchant_id: &Uuid,
-    state: &AppState,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let mnemonic_phrase = std::env::var("SOLAPAY_MASTER_MNEMONIC")
         .map_err(|_| "SOLAPAY_MASTER_MNEMONIC environment variable must be set")?;
@@ -534,10 +547,6 @@ async fn generate_merchant_wallet_from_mnemonic(
     let verifying_key = signing_key.verifying_key();
     let public_key = bs58::encode(verifying_key.to_bytes()).into_string();
 
-    let merchant_index = get_merchant_derivation_index(merchant_id, state).await?;
-
-    store_wallet_metadata(merchant_id, &public_key, merchant_index, "mnemonic-derived", state).await?;
-    
     tracing::info!("Generated mnemonic-derived wallet {} for merchant {}", public_key, merchant_id);
     
     Ok(public_key)
@@ -565,10 +574,10 @@ async fn store_wallet_metadata(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     sqlx::query!(
         r#"
-        INSERT INTO merchant_wallets 
-        (merchant_id, public_key, derivation_index, derivation_path, created_at)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO merchant_wallets (id, merchant_id, public_key, derivation_index, derivation_path, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6)
         "#,
+        Uuid::new_v4(),
         merchant_id,
         public_key,
         derivation_index as i32,
@@ -578,6 +587,7 @@ async fn store_wallet_metadata(
     .execute(&state.db)
     .await?;
     
+    tracing::info!("Stored wallet metadata for merchant {}", merchant_id);
     Ok(())
 }
 
