@@ -1,0 +1,118 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, payment_id, payment_token, settlement_token, \n               amount_recieved, amount_settled, exchange_rate_used, \n               sol_swap_signature, merchant_id, status, external_reference,\n               provider, created_at, completed_at, settlement_currency,\n               recipient_wallet, transaction_signature\n        FROM settlements\n        WHERE merchant_id = $1\n        ORDER BY created_at DESC\n        LIMIT 100\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "payment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "payment_token",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "settlement_token",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "amount_recieved",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "amount_settled",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 6,
+        "name": "exchange_rate_used",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 7,
+        "name": "sol_swap_signature",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "merchant_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "external_reference",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "provider",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "settlement_currency",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 15,
+        "name": "recipient_wallet",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 16,
+        "name": "transaction_signature",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "504d2c644951388b989dc5e82733d370d24403db64c31f559bc298507099fe92"
+}

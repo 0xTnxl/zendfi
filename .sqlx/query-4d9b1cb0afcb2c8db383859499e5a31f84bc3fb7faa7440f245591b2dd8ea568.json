@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT backup_location, verification_status\n            FROM backup_metadata\n            WHERE id = $1 AND status = 'completed'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "backup_location",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "verification_status",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "4d9b1cb0afcb2c8db383859499e5a31f84bc3fb7faa7440f245591b2dd8ea568"
+}

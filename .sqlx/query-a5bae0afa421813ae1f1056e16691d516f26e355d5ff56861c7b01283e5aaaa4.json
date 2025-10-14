@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM rate_limit_entries WHERE rate_limit_key = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a5bae0afa421813ae1f1056e16691d516f26e355d5ff56861c7b01283e5aaaa4"
+}

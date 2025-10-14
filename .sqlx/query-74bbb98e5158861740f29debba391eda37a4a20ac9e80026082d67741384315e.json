@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE backup_metadata\n            SET status = $1, end_time = NOW(), backup_size_bytes = $2, \n                verification_hash = $3, pg_wal_position = $4, verification_status = $5\n            WHERE id = $6\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Int8",
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "74bbb98e5158861740f29debba391eda37a4a20ac9e80026082d67741384315e"
+}

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(*) as hourly_count\n        FROM payments \n        WHERE merchant_id = $1 \n          AND created_at >= NOW() - INTERVAL '1 hour'\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "hourly_count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "f60215b2af7aa872c57537660ddde445a09312e9a8525a1f0f9bbae9596fd617"
+}

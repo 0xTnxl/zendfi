@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO payment_links \n        (id, merchant_id, link_code, amount_usd, currency, token, description, metadata, max_uses, expires_at, is_active, created_at)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Varchar",
+        "Numeric",
+        "Varchar",
+        "Varchar",
+        "Text",
+        "Jsonb",
+        "Int4",
+        "Timestamptz",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "52dbe1579301a1d070cf3d2c31d5954a84d4dfb38c795c7f940e7f032a9c04e2"
+}
