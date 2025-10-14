@@ -1,6 +1,6 @@
 use uuid::Uuid;
 use bigdecimal::ToPrimitive;
-use crate::{AppState, models::*};
+use crate::{AppState, models::*, key_manager::SecureKeyManager};
 use solana_sdk::{
     transaction::Transaction,
     instruction::Instruction,
@@ -346,15 +346,8 @@ async fn execute_jupiter_swap_transaction(
     Ok(signature.to_string())
 }
 
-async fn execute_crypto_transfer(
-    state: &AppState,
-    settlement_id: Uuid,
-    amount: f64,
-    token: &str,
-    recipient_wallet: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing::info!("Executing {} transfer: ${} to {}", token, amount, recipient_wallet);
-    
+/// Fallback: Load keypair from filesystem (legacy method)
+pub fn load_keypair_from_filesystem(state: &AppState) -> Result<Keypair, Box<dyn std::error::Error + Send + Sync>> {
     let keypair_path = state.config.wallet_keypair_path
         .as_ref()
         .ok_or("Escrow wallet keypair path not configured - check WALLET_KEYPAIR_PATH")?;
@@ -366,14 +359,14 @@ async fn execute_crypto_transfer(
     let keypair_bytes = fs::read(keypair_path)
         .map_err(|e| format!("Failed to read keypair file {}: {}", keypair_path, e))?;
 
-    let escrow_keypair = if keypair_bytes.len() == 64 {
+    if keypair_bytes.len() == 64 {
         let mut keypair_array = [0u8; 64];
         keypair_array.copy_from_slice(&keypair_bytes);
         Keypair::try_from(&keypair_array[..])
-            .map_err(|e| format!("Failed to parse 64-byte keypair: {}", e))?
+            .map_err(|e| format!("Failed to parse 64-byte keypair: {}", e).into())
     } else if keypair_bytes.len() == 32 {
         Keypair::try_from(&keypair_bytes[..])
-            .map_err(|e| format!("Failed to parse 32-byte seed: {}", e))?
+            .map_err(|e| format!("Failed to parse 32-byte seed: {}", e).into())
     } else {
         let key_data: Vec<u8> = serde_json::from_slice(&keypair_bytes)
             .map_err(|e| format!("Invalid keypair format (not 32, 64 bytes, or JSON): {} bytes, error: {}", keypair_bytes.len(), e))?;
@@ -382,9 +375,43 @@ async fn execute_crypto_transfer(
             let mut keypair_array = [0u8; 64];
             keypair_array.copy_from_slice(&key_data);
             Keypair::try_from(&keypair_array[..])
-                .map_err(|e| format!("Failed to parse JSON keypair: {}", e))?
+                .map_err(|e| format!("Failed to parse JSON keypair: {}", e).into())
         } else {
-            return Err(format!("JSON keypair has invalid length: {} (expected 64)", key_data.len()).into());
+            Err(format!("JSON keypair has invalid length: {} (expected 64)", key_data.len()).into())
+        }
+    }
+}
+
+async fn execute_crypto_transfer(
+    state: &AppState,
+    settlement_id: Uuid,
+    amount: f64,
+    token: &str,
+    recipient_wallet: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!("Executing {} transfer: ${} to {}", token, amount, recipient_wallet);
+    
+    // Try encrypted key manager first, fallback to filesystem
+    let escrow_keypair = match SecureKeyManager::from_env() {
+        Ok(key_manager) => {
+            tracing::info!("Using encrypted key manager for escrow wallet");
+            // System UUID for escrow wallet (not merchant-specific)
+            let system_uuid = Uuid::parse_str("00000000-0000-0000-0000-000000000001")?;
+            
+            match key_manager.retrieve_keypair(state, "escrow_wallet", system_uuid).await {
+                Ok(keypair) => {
+                    tracing::info!("Successfully retrieved encrypted escrow keypair");
+                    keypair
+                }
+                Err(e) => {
+                    tracing::warn!("Encrypted key not found, falling back to filesystem: {}", e);
+                    load_keypair_from_filesystem(state)?
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Encrypted key manager not configured, using filesystem: {}", e);
+            load_keypair_from_filesystem(state)?
         }
     };
 

@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COALESCE(MAX(derivation_index), 0) + 1 as next_index FROM merchant_wallets",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "next_index",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8f0380447cacb3fad61b2d38f1f6b42aaf3bf0be5b7600561665576c8efa6146"
+}

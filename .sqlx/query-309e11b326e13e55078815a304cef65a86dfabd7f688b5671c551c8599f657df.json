@@ -1,0 +1,82 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, merchant_id, link_code, amount_usd, currency, token, max_uses, uses_count, expires_at, is_active, created_at\n        FROM payment_links\n        WHERE link_code = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "merchant_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "link_code",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "amount_usd",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "currency",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "token",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "max_uses",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "uses_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "is_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "309e11b326e13e55078815a304cef65a86dfabd7f688b5671c551c8599f657df"
+}

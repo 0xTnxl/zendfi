@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT max_payment_amount, daily_volume_limit, rate_limit_per_hour\n        FROM merchant_limits \n        WHERE merchant_id = $1 AND is_active = true\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "max_payment_amount",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 1,
+        "name": "daily_volume_limit",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 2,
+        "name": "rate_limit_per_hour",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a43a89e6afefedb7560f48c6b0142f868f92bab91d26b41fd48289229fcdec3d"
+}

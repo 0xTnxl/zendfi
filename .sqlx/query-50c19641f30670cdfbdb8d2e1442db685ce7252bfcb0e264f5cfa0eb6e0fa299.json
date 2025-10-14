@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, backup_type, backup_location, backup_size_bytes, \n               status, verification_status, start_time, end_time\n        FROM backup_metadata\n        ORDER BY start_time DESC\n        LIMIT 50\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "backup_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "backup_location",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "backup_size_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "verification_status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "start_time",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "end_time",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "50c19641f30670cdfbdb8d2e1442db685ce7252bfcb0e264f5cfa0eb6e0fa299"
+}

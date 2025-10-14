@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE settlements \n           SET status = 'completed', transaction_signature = $1, completed_at = $2\n           WHERE id = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e363f2937473761aa18759600cd185ea829c4cb3be166467fe9b8a0b39f37cf8"
+}

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT webhook_secret FROM merchants WHERE id = $1 AND webhook_secret IS NOT NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "webhook_secret",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "653ddae4acf58c31231afdbc26783f39e27b2006e4bc2e7b6fe2d5c9d15b05e9"
+}

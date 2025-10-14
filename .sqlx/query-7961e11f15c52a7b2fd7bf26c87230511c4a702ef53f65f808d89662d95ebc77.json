@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COALESCE(SUM(amount_usd), 0) as daily_volume\n        FROM payments \n        WHERE merchant_id = $1 \n          AND created_at >= CURRENT_DATE \n          AND status IN ('pending', 'confirmed')\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "daily_volume",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "7961e11f15c52a7b2fd7bf26c87230511c4a702ef53f65f808d89662d95ebc77"
+}

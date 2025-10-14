@@ -30,6 +30,11 @@ mod rate_limiter;
 mod database;
 mod config;
 mod webhooks;
+mod key_manager;
+mod backup;
+mod checkout;
+mod admin;
+mod invoices;
 
 use handlers::*;
 use config::Config;
@@ -213,34 +218,39 @@ async fn rate_limiting_middleware(
 }
 
 async fn public_rate_limiting_middleware(
+    State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let state = request.extensions().get::<AppState>().unwrap().clone();
-
+    tracing::debug!("Public rate limiting check for IP: {}", addr.ip());
+    
     let ip_hash = {
         use sha2::{Sha256, Digest};
         let mut hasher = Sha256::new();
         hasher.update(addr.ip().to_string().as_bytes());
-        hex::encode(hasher.finalize())[..16].to_string() 
+        hex::encode(hasher.finalize())[..16].to_string()
     };
 
     let rate_limit_key = format!("public_ip_{}", ip_hash);
-    let rate_limiter = PersistentRateLimiter::new(10, 3600); 
+    // Increased from 10 to 100 requests per hour for better UX
+    let rate_limiter = PersistentRateLimiter::new(100, 3600);
 
-    let rate_limit_result = rate_limiter
-        .check_rate_limit(&state, &rate_limit_key, None)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    if !rate_limit_result.allowed {
-        tracing::warn!("Public rate limit exceeded for IP: {}", addr.ip());
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+    match rate_limiter.check_rate_limit(&state, &rate_limit_key, None).await {
+        Ok(rate_limit_result) => {
+            if !rate_limit_result.allowed {
+                tracing::warn!("Public rate limit exceeded for IP: {}", addr.ip());
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            }
+            Ok(next.run(request).await)
+        }
+        Err(e) => {
+            tracing::error!("Rate limiter error: {:?}", e);
+            Ok(next.run(request).await)
+        }
     }
-
-    Ok(next.run(request).await)
 }
+
 
 async fn correlation_id_middleware(mut request: Request, next: Next) -> Result<Response, StatusCode> {
     let correlation_id = Uuid::new_v4().to_string();
@@ -258,6 +268,26 @@ async fn correlation_id_middleware(mut request: Request, next: Next) -> Result<R
 
     let response = next.run(request).instrument(span).await;
     Ok(response)
+}
+
+async fn admin_auth_middleware(
+    headers: axum::http::HeaderMap,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    if !auth_header.starts_with("Bearer ") {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let token = &auth_header[7..];
+    admin::verify_admin_token(token).await?;
+
+    Ok(next.run(request).await)
 }
 
 #[tokio::main]
@@ -321,7 +351,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(_) => tracing::info!("Solana RPC connection verified"),
         Err(e) => {
             tracing::error!("Solana RPC connection failed: {}", e);
-            // Don't exit, we'll let it try to recover
         }
     }
 
@@ -331,13 +360,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let monitor_state = state.clone();
     tokio::spawn(solana::start_payment_monitor(monitor_state));
 
+    // Start backup worker if enabled
+    if std::env::var("ENABLE_AUTO_BACKUP").unwrap_or_else(|_| "false".to_string()) == "true" {
+        let backup_state = state.clone();
+        tokio::spawn(backup::start_backup_worker(backup_state));
+        tracing::info!("Automated backup worker started");
+    }
+
 
     let public_routes = Router::new()
         .route("/health", get(health_check))
         .route("/system/health", get(system_health))
         .route("/", get(root_handler))
         .route("/api/v1/merchants", post(create_merchant))
-        .route_layer(middleware::from_fn(public_rate_limiting_middleware)) 
+        // Hosted checkout & payment links (public)
+        .route("/checkout/:link_code", get(checkout::get_hosted_checkout_page))
+        .route("/pay/:payment_id", get(checkout::get_payment_page))
+        .route("/api/v1/payment-links/:link_code", get(checkout::get_payment_link))
+        .route("/api/v1/payment-links/:link_code/pay", post(checkout::create_payment_from_link))
+        .route_layer(middleware::from_fn_with_state(state.clone(), public_rate_limiting_middleware))  // Now properly configured
         .with_state(state.clone());
 
     let protected_routes = Router::new()
@@ -348,14 +389,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/dashboard", get(get_merchant_dashboard))
         .route("/api/v1/webhooks", get(webhooks::list_webhook_events))
         .route("/api/v1/webhooks/:id/retry", post(webhooks::retry_webhook))
+        // Payment links management (protected)
+        .route("/api/v1/payment-links", post(checkout::create_payment_link))
+        // Invoice management (protected)
+        .route("/api/v1/invoices", post(invoices::create_invoice))
+        .route("/api/v1/invoices", get(invoices::list_invoices))
+        .route("/api/v1/invoices/:id", get(invoices::get_invoice))
+        .route("/api/v1/invoices/:id/send", post(invoices::send_invoice))
+        // Rate limit management
+        .route("/api/v1/rate-limit/status", get(get_rate_limit_status))
+        .route("/api/v1/rate-limit/reset/:merchant_id", post(reset_merchant_rate_limit))
         .with_state(state.clone())
         .route_layer(middleware::from_fn_with_state(state.clone(), rate_limiting_middleware))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::authenticate_merchant));
+
+    // Admin routes (protected with admin token)
+    let admin_routes = Router::new()
+        // Key management
+        .route("/admin/keys/migrate", post(admin::migrate_key_to_encrypted))
+        .route("/admin/keys/status", get(admin::get_encryption_status))
+        .route("/admin/keys/rotate", post(admin::rotate_encryption_keys))
+        .route("/admin/keys/verify/:public_key", get(admin::verify_encrypted_key))
+        // Backup management
+        .route("/admin/backups/trigger", post(admin::trigger_backup))
+        .route("/admin/backups/list", get(admin::list_backups))
+        .route("/admin/backups/cleanup/:retention_days", post(admin::cleanup_old_backups))
+        .route("/admin/backups/restore/:backup_id", post(admin::restore_from_backup))
+        // Settlement queries
+        .route("/admin/settlements/:merchant_id", get(admin::get_settlement_history))
+        .with_state(state.clone())
+        .route_layer(middleware::from_fn(admin_auth_middleware));
     
     // Combine the routers
     let app = Router::new()
         .merge(public_routes)
         .merge(protected_routes)
+        .merge(admin_routes)
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn(error_handler_middleware))
         .layer(middleware::from_fn(correlation_id_middleware))
@@ -368,17 +437,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Health endpoint: http://0.0.0.0:{}/system/health", config.port);
     tracing::info!("API Documentation: http://0.0.0.0:{}/", config.port);
     
-    // And yes! A graceful shutdown
     let shutdown = async {
         tokio::signal::ctrl_c()
             .await
             .expect("Failed to install CTRL+C signal handler");
-        tracing::info!("Recieved shutdown signal, gracefully shutting down...");
+        tracing::info!("Received shutdown signal, gracefully shutting down...");
     };
-    
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>() 
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
     
     Ok(())
 }

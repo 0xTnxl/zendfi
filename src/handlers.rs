@@ -1,5 +1,3 @@
-#[allow(dead_code)]
-
 use axum::{
     extract::{State, Path, Extension},
     http::StatusCode,
@@ -592,6 +590,7 @@ async fn store_wallet_metadata(
     Ok(())
 }
 
+/// Sign transaction using merchant's HD wallet (for future settlement features)
 #[allow(dead_code)]
 pub async fn sign_settlement_transaction(
     state: &AppState,
@@ -891,13 +890,13 @@ async fn check_database_health(db: &sqlx::PgPool) -> bool {
     sqlx::query("SELECT 1").fetch_one(db).await.is_ok()
 }
 
-pub async fn health_check() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+pub async fn health_check() -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({
         "status": "healthy",
-        "service": "Solapay Payment Gateway",
+        "service": "ZenFi Payment Gateway",
         "timestamp": chrono::Utc::now(),
         "version": "0.1.0"
-    }))
+    })))
 }
 
 pub async fn get_rate_limit_status(

@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT public_key, derivation_index, derivation_path\n            FROM merchant_wallets\n            WHERE merchant_id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "public_key",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "derivation_index",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "derivation_path",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e30d21fc82d0bfe3e0c05601437d5a78aa89fa68d5887fdfc2284b3b5daf1417"
+}

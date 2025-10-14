@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use bigdecimal::BigDecimal;
 
 #[derive(Debug, Serialize, Deserialize, FromRow)]
+#[allow(dead_code)] 
 pub struct Merchant {
     pub id: Uuid,
     pub name: String,
@@ -96,6 +97,7 @@ pub struct SettlementInfo {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct ExchangeRate {
     pub usd_to_ngn: f64,
     pub updated_at: DateTime<Utc>,
@@ -112,17 +114,8 @@ pub struct MerchantDashboard {
     pub success_rate: f64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WebhookPayload {
-    pub payment_id: Uuid,
-    pub status: PaymentStatus,
-    pub amount_usd: f64,
-    pub amount_ngn: Option<f64>,
-    pub transaction_signature: Option<String>,
-    pub timestamp: DateTime<Utc>,
-    pub metadata: serde_json::Value,
-}
-
+// Note: Settlement struct kept for database queries
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Settlement {
     pub id: Uuid,

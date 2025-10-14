@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO settlements \n        (id, payment_id, payment_token, settlement_token, amount_recieved, amount_settled,\n         settlement_currency, recipient_wallet, merchant_id, status, provider, created_at)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'processing', 'solapay_dex', $10)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Numeric",
+        "Numeric",
+        "Varchar",
+        "Text",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9beea9b89c86f9cb623a2e462142866b5b1eeaf2f6233cefa5550c0c1595116e"
+}

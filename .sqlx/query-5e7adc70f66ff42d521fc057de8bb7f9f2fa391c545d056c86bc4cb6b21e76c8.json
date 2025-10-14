@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO payments \n        (id, merchant_id, amount_usd, status, expires_at, payment_token, payment_link_id, metadata, created_at)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Numeric",
+        {
+          "Custom": {
+            "name": "payment_status",
+            "kind": {
+              "Enum": [
+                "pending",
+                "confirmed",
+                "failed",
+                "expired"
+              ]
+            }
+          }
+        },
+        "Timestamptz",
+        "Varchar",
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5e7adc70f66ff42d521fc057de8bb7f9f2fa391c545d056c86bc4cb6b21e76c8"
+}
